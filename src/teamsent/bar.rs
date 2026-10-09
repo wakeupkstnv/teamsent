@@ -5,8 +5,10 @@
 //! the floor, and turns into a composer on `Ctrl+]`: Enter sends a suggestion,
 //! Esc cancels, and the draft streams to the host as it is typed.
 //!
-//! The bar is drawn after every chunk of client output with save/restore
-//! cursor, so the client never notices it.
+//! The bar is drawn with save/restore cursor, so the client never notices it,
+//! and only between escape sequences: client output arrives in arbitrary
+//! chunks, and painting in the middle of a sequence would corrupt it (the rest
+//! of the sequence would print as text). `Stream` tracks that boundary.
 
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -232,14 +234,112 @@ impl Bar {
     }
 }
 
-type Shared = Arc<Mutex<Bar>>;
-type Out = Arc<Mutex<io::Stdout>>;
+/// Where the client's output stream is: between sequences or inside one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Seq {
+    #[default]
+    Ground,
+    Esc,
+    /// `ESC` + intermediate bytes (e.g. `ESC ( B`).
+    EscIntermediate,
+    Csi,
+    /// OSC, DCS, APC, PM, SOS payloads: end with BEL or `ESC \`.
+    Str,
+    StrEsc,
+}
 
+#[derive(Debug, Default)]
+struct Stream {
+    seq: Seq,
+    /// Continuation bytes still expected for the current UTF-8 character.
+    utf8_left: u8,
+}
+
+impl Stream {
+    fn feed(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.seq = match self.seq {
+                Seq::Ground => match b {
+                    0x1b => {
+                        self.utf8_left = 0;
+                        Seq::Esc
+                    }
+                    0x80..=0xbf => {
+                        self.utf8_left = self.utf8_left.saturating_sub(1);
+                        Seq::Ground
+                    }
+                    0xc0..=0xdf => {
+                        self.utf8_left = 1;
+                        Seq::Ground
+                    }
+                    0xe0..=0xef => {
+                        self.utf8_left = 2;
+                        Seq::Ground
+                    }
+                    0xf0..=0xf7 => {
+                        self.utf8_left = 3;
+                        Seq::Ground
+                    }
+                    _ => {
+                        self.utf8_left = 0;
+                        Seq::Ground
+                    }
+                },
+                Seq::Esc => match b {
+                    b'[' => Seq::Csi,
+                    b']' | b'P' | b'_' | b'^' | b'X' => Seq::Str,
+                    0x20..=0x2f => Seq::EscIntermediate,
+                    0x1b => Seq::Esc,
+                    _ => Seq::Ground,
+                },
+                Seq::EscIntermediate => match b {
+                    0x20..=0x2f => Seq::EscIntermediate,
+                    0x1b => Seq::Esc,
+                    _ => Seq::Ground,
+                },
+                Seq::Csi => match b {
+                    0x40..=0x7e => Seq::Ground,
+                    0x1b => Seq::Esc,
+                    _ => Seq::Csi,
+                },
+                Seq::Str => match b {
+                    0x07 => Seq::Ground,
+                    0x1b => Seq::StrEsc,
+                    _ => Seq::Str,
+                },
+                Seq::StrEsc => match b {
+                    b'\\' => Seq::Ground,
+                    0x1b => Seq::StrEsc,
+                    _ => Seq::Str,
+                },
+            };
+        }
+    }
+
+    /// True when writing our own sequences now cannot split one of the client's.
+    fn at_boundary(&self) -> bool {
+        self.seq == Seq::Ground && self.utf8_left == 0
+    }
+}
+
+/// The real terminal plus the parse state of everything the client wrote to it.
+struct Term {
+    stdout: io::Stdout,
+    stream: Stream,
+}
+
+type Shared = Arc<Mutex<Bar>>;
+type Out = Arc<Mutex<Term>>;
+
+/// Paints the bar now if that is safe; otherwise the output thread paints it
+/// after the client's current sequence ends.
 fn repaint(bar: &Shared, out: &Out) {
     let paint = bar.lock().unwrap().paint();
-    let mut out = out.lock().unwrap();
-    let _ = out.write_all(paint.as_bytes());
-    let _ = out.flush();
+    let mut term = out.lock().unwrap();
+    if term.stream.at_boundary() {
+        let _ = term.stdout.write_all(paint.as_bytes());
+        let _ = term.stdout.flush();
+    }
 }
 
 /// Runs the herdr client with the bar below it. `link` is the invite link with
@@ -286,7 +386,10 @@ pub(crate) fn run_client(
         rows,
         cols,
     }));
-    let out: Out = Arc::new(Mutex::new(io::stdout()));
+    let out: Out = Arc::new(Mutex::new(Term {
+        stdout: io::stdout(),
+        stream: Stream::default(),
+    }));
 
     // Collab channel: state in, drafts and submits out.
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
@@ -341,10 +444,13 @@ pub(crate) fn run_client(
                     Ok(n) => n,
                 };
                 let paint = bar.lock().unwrap().paint();
-                let mut out = out.lock().unwrap();
-                let _ = out.write_all(&chunk[..n]);
-                let _ = out.write_all(paint.as_bytes());
-                let _ = out.flush();
+                let mut term = out.lock().unwrap();
+                let _ = term.stdout.write_all(&chunk[..n]);
+                term.stream.feed(&chunk[..n]);
+                if term.stream.at_boundary() {
+                    let _ = term.stdout.write_all(paint.as_bytes());
+                }
+                let _ = term.stdout.flush();
             }
         })
     };
@@ -474,9 +580,9 @@ pub(crate) fn run_client(
     crossterm::terminal::disable_raw_mode()?;
     {
         let rows = bar.lock().unwrap().rows;
-        let mut out = out.lock().unwrap();
-        let _ = write!(out, "\x1b[{rows};1H\x1b[2K\r\n");
-        let _ = out.flush();
+        let mut term = out.lock().unwrap();
+        let _ = write!(term.stdout, "\x1b[{rows};1H\x1b[2K\r\n");
+        let _ = term.stdout.flush();
     }
     if status.success() {
         Ok(())
@@ -551,6 +657,51 @@ mod tests {
         assert_eq!(find_toggle(b"ab\x1dcd"), Some((2, 1)));
         assert_eq!(find_toggle(b"a\x1b[93;5u"), Some((1, 7)));
         assert_eq!(find_toggle(b"abc"), None);
+    }
+
+    fn boundary_after(chunks: &[&[u8]]) -> Vec<bool> {
+        let mut stream = Stream::default();
+        chunks
+            .iter()
+            .map(|c| {
+                stream.feed(c);
+                stream.at_boundary()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_paint_inside_split_sequences() {
+        // CSI split across chunks (the bug from the screenshot).
+        assert_eq!(
+            boundary_after(&[b"text\x1b[0;38;2;13", b"7;180;250;49m", b"more"]),
+            vec![false, true, true]
+        );
+        // OSC ended by BEL and by ST, split.
+        assert_eq!(
+            boundary_after(&[b"\x1b]0;title", b"\x07"]),
+            vec![false, true]
+        );
+        assert_eq!(
+            boundary_after(&[b"\x1b]8;;url\x1b", b"\\"]),
+            vec![false, true]
+        );
+        // Kitty graphics APC payload.
+        assert_eq!(
+            boundary_after(&[b"\x1b_Gf=100;AAAA", b"BBBB\x1b\\"]),
+            vec![false, true]
+        );
+        // Lone ESC at the end of a chunk, charset designation.
+        assert_eq!(
+            boundary_after(&[b"\x1b", b"(", b"B"]),
+            vec![false, false, true]
+        );
+        // UTF-8 character split.
+        let bytes = "й".as_bytes();
+        assert_eq!(
+            boundary_after(&[&bytes[..1], &bytes[1..]]),
+            vec![false, true]
+        );
     }
 
     #[test]
