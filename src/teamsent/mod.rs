@@ -6,23 +6,28 @@
 mod filter;
 mod host;
 mod join;
-mod relay;
 
 use std::io;
 use std::time::Duration;
 
-/// Sent by the relay on the host control connection after registration.
-pub(crate) const PROTOCOL_TAG: &str = "teamsent-relay-v0";
+pub(crate) use teamsent_relay::PROTOCOL_TAG;
 
 /// Runs a teamsent subcommand, or returns `None` when `args[1]` is not one.
 pub(crate) fn maybe_run(args: &[String]) -> Option<io::Result<()>> {
     let rest = args.get(2..).unwrap_or_default();
     match args.get(1).map(String::as_str)? {
-        "host" => Some(host::run(rest)),
-        "join" => Some(join::run(rest)),
-        "relay" => Some(relay::run(rest)),
+        "host" => Some(with_tls(|| host::run(rest))),
+        "join" => Some(with_tls(|| join::run(rest))),
+        "relay" => Some(teamsent_relay::run(rest)),
         _ => None,
     }
+}
+
+/// Installs the process-wide TLS crypto provider so `wss://` relays work.
+fn with_tls(run: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+    // Err means a provider is already installed, which is fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    run()
 }
 
 /// Longest invite lifetime (N3: tokens live at most 24 hours).
@@ -85,7 +90,7 @@ pub(crate) fn is_valid_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// 128-bit random id, hex encoded. Used for rooms, host keys and channels.
+/// 128-bit random id, hex encoded. Used for rooms, host keys and invite tokens.
 pub(crate) fn random_id() -> String {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("OS random source is available");

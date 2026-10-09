@@ -1,0 +1,18 @@
+[Unit]
+Description=teamsent relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/teamsent-relay --listen 127.0.0.1:7878
+Restart=always
+RestartSec=2
+DynamicUser=yes
+# The relay keeps rooms in memory only: no state, no writable paths.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

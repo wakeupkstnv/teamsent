@@ -19,7 +19,8 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
-use super::{random_id, PROTOCOL_TAG};
+/// Sent on the host control connection after the room is registered.
+pub const PROTOCOL_TAG: &str = "teamsent-relay-v0";
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:7878";
 const CHANNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -34,7 +35,8 @@ struct Room {
 
 type Rooms = Arc<Mutex<HashMap<String, Room>>>;
 
-pub(crate) fn run(args: &[String]) -> io::Result<()> {
+/// Runs the relay: `[--listen ADDR:PORT]`, default `127.0.0.1:7878`.
+pub fn run(args: &[String]) -> io::Result<()> {
     let listen = match args {
         [] => DEFAULT_LISTEN.to_string(),
         [flag, addr] if flag == "--listen" => addr.clone(),
@@ -215,4 +217,11 @@ async fn splice(a: Ws, b: Ws) {
         _ = a_to_b => {}
         _ = b_to_a => {}
     }
+}
+
+/// 128-bit random channel id, hex encoded.
+fn random_id() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("OS random source is available");
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

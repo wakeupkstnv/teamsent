@@ -27,10 +27,11 @@ use super::{
 };
 use crate::protocol::{MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE};
 
-const DEFAULT_RELAY: &str = "ws://127.0.0.1:7878";
+/// Team relay on GCP (deploy/README.md). Override with `--relay` or `TEAMSENT_RELAY`.
+const DEFAULT_RELAY: &str = "wss://34-38-17-92.sslip.io";
 const READ_CHUNK: usize = 64 * 1024;
 const USAGE: &str =
-    "usage: teamsent host [--relay ws://HOST:PORT] [--role viewer|writer] [--ttl 30m|2h|24h]";
+    "usage: teamsent host [--relay wss://HOST] [--role viewer|writer] [--ttl 30m|2h|24h]";
 const HELP: &str = "\
 commands:
   /list                       invites and guests
@@ -81,7 +82,10 @@ pub(crate) fn run(args: &[String]) -> io::Result<()> {
 
 fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut options = Options {
-        relay: DEFAULT_RELAY.to_string(),
+        relay: std::env::var("TEAMSENT_RELAY")
+            .unwrap_or_else(|_| DEFAULT_RELAY.to_string())
+            .trim_end_matches('/')
+            .to_string(),
         role: Role::Viewer,
         ttl: MAX_INVITE_TTL,
     };

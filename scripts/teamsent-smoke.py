@@ -2,6 +2,7 @@
 
 usage: python3 -I scripts/teamsent-smoke.py target/debug/teamsent /tmp/ts-e2e
 The work dir must be short (unix socket paths are limited to ~104 bytes).
+Set TEAMSENT_RELAY=wss://… to test against a deployed relay instead of a local one.
 """
 import json, os, pty, re, select, signal, struct, subprocess, sys, time, fcntl, termios
 
@@ -106,9 +107,12 @@ class Guest:
 checks = {}
 guests = []
 try:
-    _, relay_log = bg("relay", "relay", "--listen", f"127.0.0.1:{PORT}")
-    assert wait_log(relay_log, r"listening", 5), "relay did not start"
-    host, host_log = bg("host", "host", "--relay", f"ws://127.0.0.1:{PORT}", stdin=subprocess.PIPE)
+    relay = os.environ.get("TEAMSENT_RELAY")
+    if not relay:
+        relay = f"ws://127.0.0.1:{PORT}"
+        _, relay_log = bg("relay", "relay", "--listen", f"127.0.0.1:{PORT}")
+        assert wait_log(relay_log, r"listening", 5), "relay did not start"
+    host, host_log = bg("host", "host", "--relay", relay, stdin=subprocess.PIPE)
     m = wait_log(host_log, r"teamsent join (\S+)", 15)
     assert m, "host printed no link:\n" + open(host_log).read()
     viewer_link = m.group(1)

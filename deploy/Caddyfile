@@ -1,0 +1,5 @@
+# Caddy terminates TLS (automatic Let's Encrypt) and proxies WebSockets to the relay.
+# RELAY_DOMAIN comes from /etc/default/teamsent-relay.
+{$RELAY_DOMAIN} {
+	reverse_proxy 127.0.0.1:7878
+}
