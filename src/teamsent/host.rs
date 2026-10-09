@@ -179,7 +179,7 @@ async fn control_loop(options: Options) -> io::Result<()> {
 }
 
 fn join_link(relay: &str, room: &str, token: &str) -> String {
-    format!("{relay}/join/{room}?t={token}")
+    format!("{relay}/join/{room}/{token}")
 }
 
 fn create_invite(state: &Shared, role: Role, ttl: Duration) -> String {

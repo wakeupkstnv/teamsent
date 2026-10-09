@@ -24,7 +24,7 @@ const ACCEPT_POLL: Duration = Duration::from_millis(20);
 const READ_CHUNK: usize = 64 * 1024;
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 
-const USAGE: &str = "usage: teamsent join ws://HOST:PORT/join/ROOM?t=TOKEN [--name NAME]";
+const USAGE: &str = "usage: teamsent join ws://HOST:PORT/join/ROOM/TOKEN [--name NAME]";
 
 pub(crate) fn run(args: &[String]) -> io::Result<()> {
     let usage = |msg: &str| io::Error::new(io::ErrorKind::InvalidInput, format!("{msg}{USAGE}"));
@@ -43,7 +43,7 @@ pub(crate) fn run(args: &[String]) -> io::Result<()> {
     if !is_join_link(link) {
         return Err(usage("not a teamsent invite link\n"));
     }
-    let link = format!("{link}&name={name}");
+    let link = format!("{link}?name={name}");
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -100,8 +100,10 @@ pub(crate) fn run(args: &[String]) -> io::Result<()> {
 
 fn is_join_link(link: &str) -> bool {
     (link.starts_with("ws://") || link.starts_with("wss://"))
-        && link.contains("/join/")
-        && link.contains("?t=")
+        && !link.contains('?')
+        && link
+            .split_once("/join/")
+            .is_some_and(|(_, rest)| rest.split('/').filter(|s| !s.is_empty()).count() == 2)
 }
 
 fn default_name() -> String {

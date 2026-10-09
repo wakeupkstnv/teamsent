@@ -2,7 +2,7 @@
 //!
 //! Routes (all WebSocket):
 //! - `/host/{room}?key={key}`  host control connection; registers the room.
-//! - `/join/{room}`            guest connection; relay asks the host for a channel.
+//! - `/join/{room}/{token}`    guest connection; relay asks the host for a channel.
 //! - `/chan/{room}/{chan}?key={key}`  host channel answering one guest.
 //!
 //! The relay splices guest and channel byte streams. It keeps nothing on disk.
@@ -89,7 +89,15 @@ async fn handle(tcp: TcpStream, rooms: Rooms) -> Result<(), String> {
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match parts.as_slice() {
         ["host", room] => host_control(ws, room, key, rooms).await,
-        ["join", room] => guest(ws, room, query, rooms).await,
+        // The invite token is a path segment so links paste into any shell unquoted.
+        ["join", room, token] if token.chars().all(|c| c.is_ascii_alphanumeric()) => {
+            let query = if query.is_empty() {
+                format!("t={token}")
+            } else {
+                format!("t={token}&{query}")
+            };
+            guest(ws, room, &query, rooms).await
+        }
         ["chan", room, chan] => host_channel(ws, room, chan, &key, rooms),
         _ => Err(format!("unknown route {path}")),
     }

@@ -124,7 +124,7 @@ try:
     time.sleep(1)
 
     # Bad token: refused before the client UI starts.
-    code, out = run("join", re.sub(r"t=\w+", "t=bad", viewer_link), timeout=10)
+    code, out = run("join", re.sub(r"/\w+$", "/bad", viewer_link), timeout=10)
     checks["bad token refused"] = code != 0 and "unknown invite" in out
 
     # Viewer: sees everything, cannot type.
