@@ -52,6 +52,7 @@ mod selection;
 mod server;
 mod session;
 mod sound;
+mod teamsent;
 mod terminal;
 mod terminal_effects;
 mod terminal_modes;
@@ -523,6 +524,9 @@ fn main() -> io::Result<()> {
             std::process::exit(2);
         }
     };
+    if let Some(result) = teamsent::maybe_run(&args) {
+        return result;
+    }
     let (args, remote_launch) = match remote::extract_remote_args(&args) {
         Ok(parsed) => parsed,
         Err(err) => {

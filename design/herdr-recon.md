@@ -49,6 +49,16 @@ teamsent host ──WS(mux by guest id)──► room ◄──WS──── te
 
 Default-deny: unknown variants are dropped.
 
+## Answered by the smoke test (`scripts/teamsent-smoke.py`)
+
+- Guest sees the host's focused pane and live updates over the relay. ✅
+- Guest keystrokes (including `prefix c`) never reach the host: no input, no new tab. ✅
+- Guest attach does not move the host's focus. ✅
+- The client handshake is `EndpointControl { kind: "endpoint.hello.v1" }`, not
+  `ClientShellHello`. Allowed client control kinds: hello, presentation sync,
+  health ping (`CLIENT_ENDPOINT_CONTROL_KINDS` in `src/teamsent/filter.rs`).
+- Guest UI sent no endpoint requests in the smoke run (no `denied …` lines).
+
 ## Open questions (week 1–2)
 
 - Does full ClientShell view change host state (focus, tab switch, resize clamp)?
