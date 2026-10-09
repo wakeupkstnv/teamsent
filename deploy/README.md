@@ -33,3 +33,26 @@ gcloud compute ssh teamsent-relay --zone=europe-west1-b --command='sudo systemct
 ```bash
 TEAMSENT_RELAY=wss://34-38-17-92.sslip.io python3 -I scripts/teamsent-smoke.py target/debug/teamsent /tmp/ts-e2e
 ```
+
+## Downloads
+
+Guests install with:
+
+```bash
+curl -fsSL https://34-38-17-92.sslip.io/install.sh | sh
+```
+
+Caddy serves `/install.sh` and `/dl/<version>/teamsent-<os>-<arch>` from
+`/var/www/teamsent` (`dl/latest` is a symlink). The installer verifies SHA256.
+
+Build all four targets on a Mac (needs Zig 0.16, `cargo install cargo-zigbuild`,
+`rustup target add x86_64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl`):
+
+```bash
+cargo build --release --locked --bin teamsent                                   # macOS arm64
+cargo build --release --locked --bin teamsent --target x86_64-apple-darwin
+cargo zigbuild --release --locked --bin teamsent --target x86_64-unknown-linux-musl
+cargo zigbuild --release --locked --bin teamsent --target aarch64-unknown-linux-musl
+# copy each to dist/teamsent-<os>-<arch>, then:
+deploy/publish.sh 0.1.0 dist/teamsent-*
+```
