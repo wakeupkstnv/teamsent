@@ -99,6 +99,8 @@ struct State {
     driver: Option<(u32, Instant)>,
     /// The Team window's pane; guests may never type into it.
     team_pane: Option<String>,
+    /// Identifies the Team window this host opened; any other window exits.
+    team_instance: Option<String>,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -1012,6 +1014,7 @@ fn snapshot(ctx: &Ctx, me: Option<u32>) -> serde_json::Value {
         "queue": queue,
         "driver": driver.and_then(|id| st.guests.get(&id).map(|g| g.name.clone())),
         "team_pane": st.team_pane,
+        "team_instance": st.team_instance,
         "mode": if ctx.auto.load(Ordering::Relaxed) { "auto" } else { "review" },
         "paused": ctx.queue.lock().unwrap().paused,
         "names": ctx.names.load(Ordering::Relaxed),
@@ -1096,12 +1099,18 @@ fn open_team_pane(ctx: &Ctx) -> Result<String, String> {
         let _ = std::fs::write(team_marker_path(), terminal);
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let instance = random_id();
+    // `exec`: when the window exits, its pane closes instead of leaving a shell.
     let command = format!(
-        "'{}' team",
+        "exec '{}' team --instance {instance}",
         exe.display().to_string().replace('\'', "'\\''")
     );
+    {
+        let mut st = ctx.state.lock().unwrap();
+        st.team_pane = Some(pane.clone());
+        st.team_instance = Some(instance);
+    }
     queue::cli(&["pane", "run", &pane, &command])?;
-    ctx.state.lock().unwrap().team_pane = Some(pane.clone());
     Ok(pane)
 }
 

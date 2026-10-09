@@ -93,7 +93,8 @@ impl Confirm {
 
 pub(crate) fn run(args: &[String]) -> io::Result<()> {
     match args {
-        [] => tui(),
+        [] => tui(None),
+        [flag, instance] if flag == "--instance" => tui(Some(instance.clone())),
         [flag] if flag == "--once" => {
             let (rx, _) = connect()?;
             let state = recv_state(&rx, Duration::from_secs(5))
@@ -125,7 +126,7 @@ pub(crate) fn run(args: &[String]) -> io::Result<()> {
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: teamsent team [--once | --send JSON]",
+            "usage: teamsent team [--once | --send JSON | --instance ID]",
         )),
     }
 }
@@ -362,16 +363,27 @@ impl App {
     }
 }
 
+/// True when the host runs a different Team window than this one.
+fn superseded(instance: Option<&str>, state: &Value) -> bool {
+    match (instance, state["team_instance"].as_str()) {
+        (Some(mine), Some(current)) => mine != current,
+        _ => false,
+    }
+}
+
 fn contains(r: Rect, column: u16, row: u16) -> bool {
     column >= r.x && column < r.x + r.width && row >= r.y && row < r.y + r.height
 }
 
-fn tui() -> io::Result<()> {
+/// `instance`: set when `teamsent host` opened this window. The window exits
+/// (closing its pane) once the host reports a different instance, so windows
+/// from earlier runs never pile up.
+fn tui(instance: Option<String>) -> io::Result<()> {
     let mut stdout = io::stdout();
     terminal::enable_raw_mode()?;
     execute!(stdout, terminal::EnterAlternateScreen, EnableMouseCapture)?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
-    let result = tui_loop(&mut term);
+    let result = tui_loop(&mut term, instance.as_deref());
     terminal::disable_raw_mode()?;
     execute!(
         term.backend_mut(),
@@ -389,7 +401,10 @@ fn send(conn: &mut Conn, cmd: Value) {
     }
 }
 
-fn tui_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+fn tui_loop(
+    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    instance: Option<&str>,
+) -> io::Result<()> {
     let mut app = App::new();
     let mut conn: Conn = None;
     let mut dirty = true;
@@ -408,7 +423,12 @@ fn tui_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()>
         if let Some((rx, _)) = &conn {
             loop {
                 match rx.try_recv() {
-                    Ok(msg) if msg["t"] == "state" => app.state = msg,
+                    Ok(msg) if msg["t"] == "state" => {
+                        if superseded(instance, &msg) {
+                            return Ok(());
+                        }
+                        app.state = msg;
+                    }
                     Ok(msg) => app.status = msg["msg"].as_str().unwrap_or_default().to_string(),
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
@@ -1053,6 +1073,15 @@ mod tests {
             on_mouse(&mut app, click(MouseButton::Left, x, writer_row)),
             Some(json!({ "cmd": "role", "guest": 2, "role": "writer" }))
         );
+    }
+
+    #[test]
+    fn stale_windows_step_aside() {
+        let state = json!({ "team_instance": "new" });
+        assert!(superseded(Some("old"), &state));
+        assert!(!superseded(Some("new"), &state));
+        assert!(!superseded(None, &state), "a window opened by hand stays");
+        assert!(!superseded(Some("old"), &json!({})));
     }
 
     #[test]

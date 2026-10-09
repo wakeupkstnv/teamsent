@@ -289,6 +289,15 @@ try:
     code, out = run("join", m.group(1), timeout=10)
     checks["revoked link refused"] = code != 0 and "invite revoked" in out
 
+    # A Team window from an earlier host run closes itself.
+    count = lambda: run("pane", "list")[1].count('"pane_id"')
+    before = count()
+    split = json.loads(run("pane", "split", pane, "--direction", "down")[1])
+    stale = split["result"]["pane"]["pane_id"]
+    run("pane", "run", stale, f"exec '{BIN}' team --instance stale")
+    time.sleep(4)
+    checks["stale team window closes itself"] = count() == before
+
     # Stopping the host closes its Team window.
     panes_before = run("pane", "list")[1].count('"pane_id"')
     host.send_signal(signal.SIGINT)
