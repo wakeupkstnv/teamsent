@@ -18,26 +18,38 @@ use interprocess::TryClone as _;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::shutdown_local_stream;
+use super::{is_valid_name, shutdown_local_stream};
 
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
 const READ_CHUNK: usize = 64 * 1024;
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 
+const USAGE: &str = "usage: teamsent join ws://HOST:PORT/join/ROOM?t=TOKEN [--name NAME]";
+
 pub(crate) fn run(args: &[String]) -> io::Result<()> {
-    let link = match args {
-        [link] if is_join_link(link) => link.clone(),
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "usage: teamsent join ws://HOST:PORT/join/ROOM",
-            ))
+    let usage = |msg: &str| io::Error::new(io::ErrorKind::InvalidInput, format!("{msg}{USAGE}"));
+    let (link, name) = match args {
+        [link] => (link, default_name()),
+        [link, flag, name] if flag == "--name" => {
+            if !is_valid_name(name) {
+                return Err(usage(
+                    "name must be 1-32 chars of a-z, 0-9, '-', '_', '.'\n",
+                ));
+            }
+            (link, name.clone())
         }
+        _ => return Err(usage("")),
     };
+    if !is_join_link(link) {
+        return Err(usage("not a teamsent invite link\n"));
+    }
+    let link = format!("{link}&name={name}");
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    let role = runtime.block_on(probe(&link))?;
+    eprintln!("joining as {name} ({role})…");
     let socket_path = local_socket_path();
     crate::ipc::prepare_socket_path(&socket_path, |path| {
         format!("join bridge is already listening at {}", path.display())
@@ -87,7 +99,34 @@ pub(crate) fn run(args: &[String]) -> io::Result<()> {
 }
 
 fn is_join_link(link: &str) -> bool {
-    (link.starts_with("ws://") || link.starts_with("wss://")) && link.contains("/join/")
+    (link.starts_with("ws://") || link.starts_with("wss://"))
+        && link.contains("/join/")
+        && link.contains("?t=")
+}
+
+fn default_name() -> String {
+    std::env::var("USER")
+        .ok()
+        .filter(|n| is_valid_name(n))
+        .unwrap_or_else(|| "guest".to_string())
+}
+
+/// Asks the host whether this invite is valid before starting the client UI.
+/// Returns the granted role.
+async fn probe(link: &str) -> io::Result<String> {
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("{link}&probe=1"))
+        .await
+        .map_err(|err| io::Error::other(format!("cannot reach relay: {err}")))?;
+    let answer = match ws.next().await {
+        Some(Ok(Message::Text(text))) => text.to_string(),
+        _ => return Err(io::Error::other("session not found (host offline?)")),
+    };
+    let _ = ws.close(None).await;
+    if let Some(rest) = answer.strip_prefix("teamsent-ok ") {
+        return Ok(rest.split(' ').next().unwrap_or("viewer").to_string());
+    }
+    let reason = answer.strip_prefix("teamsent-denied ").unwrap_or(&answer);
+    Err(io::Error::other(format!("join refused: {reason}")))
 }
 
 fn local_socket_path() -> PathBuf {

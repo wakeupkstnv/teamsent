@@ -1,4 +1,4 @@
-"""Teamsent smoke test: relay + host + view-only guest over a pty.
+"""Teamsent smoke test: relay + host + guests over ptys.
 
 usage: python3 -I scripts/teamsent-smoke.py target/debug/teamsent /tmp/ts-e2e
 The work dir must be short (unix socket paths are limited to ~104 bytes).
@@ -23,17 +23,17 @@ def run(*args, timeout=10):
 procs = []
 
 
-def bg(name, *args):
+def bg(name, *args, stdin=None):
     log = open(os.path.join(ROOT, f"{name}.log"), "w")
-    p = subprocess.Popen([BIN, *args], env=env, stdout=log, stderr=subprocess.STDOUT)
+    p = subprocess.Popen([BIN, *args], env=env, stdin=stdin, stdout=log, stderr=subprocess.STDOUT)
     procs.append(p)
-    return os.path.join(ROOT, f"{name}.log")
+    return p, os.path.join(ROOT, f"{name}.log")
 
 
-def wait_log(path, pattern, timeout):
+def wait_log(path, pattern, timeout, start=0):
     end = time.time() + timeout
     while time.time() < end:
-        m = re.search(pattern, open(path).read())
+        m = re.search(pattern, open(path).read()[start:])
         if m:
             return m
         time.sleep(0.1)
@@ -45,63 +45,127 @@ def focused_pane():
     return next(p["pane_id"] for p in json.loads(out)["result"]["panes"] if p["focused"])
 
 
+def pane_text(pane):
+    return run("pane", "read", pane, "--source", "recent", "--lines", "80")[1]
+
+
+class Guest:
+    def __init__(self, link, name):
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            os.execve(BIN, [BIN, "join", link, "--name", name], env)
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+        self.closed = False
+
+    def drain(self, seconds):
+        out = b""
+        end = time.time() + seconds
+        while time.time() < end and not self.closed:
+            r, _, _ = select.select([self.fd], [], [], 0.2)
+            if r:
+                try:
+                    chunk = os.read(self.fd, 65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    self.closed = True
+                    break
+                out += chunk
+        return out
+
+    def type(self, data):
+        try:
+            os.write(self.fd, data)
+        except OSError:
+            self.closed = True
+
+    def exited(self, seconds):
+        end = time.time() + seconds
+        while time.time() < end:
+            pid, _ = os.waitpid(self.pid, os.WNOHANG)
+            if pid:
+                self.pid = None
+                return True
+            self.drain(0.2)
+        return False
+
+    def kill(self):
+        # Close the pty first: a child blocked flushing tty output never finishes exiting.
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+        if self.pid:
+            try:
+                os.kill(self.pid, signal.SIGKILL)
+                os.waitpid(self.pid, 0)
+            except OSError:
+                pass
+
+
 checks = {}
-guest_pid = None
+guests = []
 try:
-    relay_log = bg("relay", "relay", "--listen", f"127.0.0.1:{PORT}")
+    _, relay_log = bg("relay", "relay", "--listen", f"127.0.0.1:{PORT}")
     assert wait_log(relay_log, r"listening", 5), "relay did not start"
-    host_log = bg("host", "host", "--relay", f"ws://127.0.0.1:{PORT}")
+    host, host_log = bg("host", "host", "--relay", f"ws://127.0.0.1:{PORT}", stdin=subprocess.PIPE)
     m = wait_log(host_log, r"teamsent join (\S+)", 15)
     assert m, "host printed no link:\n" + open(host_log).read()
-    link = m.group(1)
+    viewer_link = m.group(1)
+
+    def host_cmd(line, expect, timeout=5):
+        start = len(open(host_log).read())
+        host.stdin.write((line + "\n").encode())
+        host.stdin.flush()
+        return wait_log(host_log, expect, timeout, start)
 
     pane = focused_pane()
     run("pane", "run", pane, "echo TEAMSENT_$((40+2))_MARK")
     time.sleep(1)
 
-    guest_pid, fd = pty.fork()
-    if guest_pid == 0:
-        os.execve(BIN, [BIN, "join", link], env)
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+    # Bad token: refused before the client UI starts.
+    code, out = run("join", re.sub(r"t=\w+", "t=bad", viewer_link), timeout=10)
+    checks["bad token refused"] = code != 0 and "unknown invite" in out
 
-    def drain(seconds):
-        out = b""
-        end = time.time() + seconds
-        while time.time() < end:
-            r, _, _ = select.select([fd], [], [], 0.2)
-            if r:
-                try:
-                    out += os.read(fd, 65536)
-                except OSError:
-                    break
-        return out
-
-    screen = drain(6)
-    checks["guest sees host pane"] = b"TEAMSENT_42_MARK" in screen
-    if not checks["guest sees host pane"]:
-        print("guest output tail:", screen[-1500:].decode(errors="replace"))
-
+    # Viewer: sees everything, cannot type.
+    viewer = Guest(viewer_link, "viewer1")
+    guests.append(viewer)
+    checks["viewer sees host pane"] = b"TEAMSENT_42_MARK" in viewer.drain(6)
     run("pane", "run", pane, "echo LIVE_$((5+5))_UPDATE")
-    checks["guest sees live update"] = b"LIVE_10_UPDATE" in drain(3)
-
-    try:
-        os.write(fd, b"echo GUEST_$((1+1))_INPUT\r")
-        os.write(fd, b"\x02c")  # prefix + c: try to create a tab
-    except OSError as e:
-        print("guest pty closed early:", e)
-    drain(2)
-    _, text = run("pane", "read", pane, "--source", "recent", "--lines", "80")
-    checks["guest input blocked"] = "GUEST_2_INPUT" not in text and "GUEST_$((1+1))_INPUT" not in text
+    checks["viewer sees live update"] = b"LIVE_10_UPDATE" in viewer.drain(3)
+    viewer.type(b"echo VIEWER_$((1+1))_INPUT\r")
+    viewer.type(b"\x02c")  # prefix + c: try to create a tab
+    viewer.drain(2)
+    viewer.type(b"\x1b")  # leave the prefix/navigate mode the shortcut left us in
+    viewer.drain(1)
+    checks["viewer input blocked"] = "VIEWER_2_INPUT" not in pane_text(pane)
     checks["host focus unchanged"] = focused_pane() == pane
-    _, tabs = run("tab", "list")
-    checks["no tab created by guest"] = tabs.count('"tab_id"') == 1
+    checks["no tab created by viewer"] = run("tab", "list")[1].count('"tab_id"') == 1
+
+    # Writer invite: input reaches the pane.
+    m = host_cmd("/invite writer 10m", r"teamsent join (\S+)")
+    assert m, "no writer link"
+    writer = Guest(m.group(1), "writer1")
+    guests.append(writer)
+    writer.drain(4)
+    writer.type(b"echo WRITER_$((3+4))_INPUT\r")
+    writer.drain(2)
+    checks["writer input reaches pane"] = "WRITER_7_INPUT" in pane_text(pane)
+
+    # /grant: the viewer becomes a writer without reconnecting.
+    checks["/grant reported"] = bool(host_cmd("/grant 1 writer", r"#1 viewer1 is now writer"))
+    viewer.type(b"echo GRANTED_$((2+3))_INPUT\r")
+    viewer.drain(2)
+    checks["granted viewer can type"] = "GRANTED_5_INPUT" in pane_text(pane)
+
+    # /revoke: the writer is kicked and its link stops working.
+    checks["/revoke reported"] = bool(host_cmd("/revoke 2", r"invite \w+… revoked"))
+    checks["revoked guest disconnected"] = writer.exited(8)
+    code, out = run("join", m.group(1), timeout=10)
+    checks["revoked link refused"] = code != 0 and "invite revoked" in out
 finally:
-    if guest_pid:
-        try:
-            os.kill(guest_pid, signal.SIGKILL)
-            os.waitpid(guest_pid, 0)
-        except OSError:
-            pass
+    for g in guests:
+        g.kill()
     for p in procs:
         p.send_signal(signal.SIGINT)
     time.sleep(0.5)

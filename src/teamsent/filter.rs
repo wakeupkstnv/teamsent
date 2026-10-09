@@ -3,6 +3,7 @@
 //! The host decodes every frame a guest sends and only forwards frames the
 //! guest's role allows. Unknown or undecodable frames are denied.
 
+use super::Role;
 use crate::protocol::{ClientMessage, ServerMessage, MAX_FRAME_SIZE};
 
 /// Length of the u32 little-endian prefix that frames each message.
@@ -15,6 +16,19 @@ const VIEWER_ENDPOINT_METHODS: &[&str] = &[
     "pane.link.resolve",
     "pane.selection.read",
     "worktree.list",
+];
+
+/// Extra endpoint methods a writer may call: navigation, scrolling and copy
+/// mode. Creating, closing, moving or reconfiguring anything stays host-only,
+/// and so does `pane.link.activate` (it opens URLs on the host machine).
+const WRITER_ENDPOINT_METHODS: &[&str] = &[
+    "pane.copy_motion",
+    "pane.copy_search",
+    "pane.focus",
+    "pane.focus_direction",
+    "pane.scroll",
+    "tab.focus",
+    "workspace.focus",
 ];
 
 /// Endpoint control kinds a client sends during a normal session: handshake,
@@ -70,7 +84,7 @@ pub(crate) fn encode_frame(msg: &ServerMessage) -> Vec<u8> {
 }
 
 /// Decides what to do with one complete guest frame (prefix included).
-pub(crate) fn classify_viewer_frame(frame: &[u8]) -> Verdict {
+pub(crate) fn classify_frame(role: Role, frame: &[u8]) -> Verdict {
     let payload = &frame[LENGTH_PREFIX_BYTES..];
     if payload.len() > MAX_FRAME_SIZE {
         return Verdict::Close("oversized frame".into());
@@ -81,10 +95,10 @@ pub(crate) fn classify_viewer_frame(frame: &[u8]) -> Verdict {
             Ok(_) => return Verdict::Close("trailing bytes in frame".into()),
             Err(err) => return Verdict::Close(format!("undecodable frame: {err}")),
         };
-    classify_viewer(msg)
+    classify(role, msg)
 }
 
-fn classify_viewer(msg: ClientMessage) -> Verdict {
+fn classify(role: Role, msg: ClientMessage) -> Verdict {
     use ClientMessage as M;
     match msg {
         M::TerminalHello { .. }
@@ -103,7 +117,10 @@ fn classify_viewer(msg: ClientMessage) -> Verdict {
         M::Input { .. }
         | M::ClientShellPaneInput { .. }
         | M::ClientShellPopupInput { .. }
-        | M::AttachMouse { .. } => Verdict::Drop("input"),
+        | M::AttachMouse { .. } => match role {
+            Role::Writer => Verdict::Forward,
+            Role::Viewer => Verdict::Drop("input"),
+        },
 
         M::AttachTerminal { .. } | M::ControlTerminal { .. } => Verdict::Drop("terminal control"),
         M::ClipboardImage { .. } => Verdict::Drop("clipboard"),
@@ -116,12 +133,12 @@ fn classify_viewer(msg: ClientMessage) -> Verdict {
         }
 
         M::ClientShellEndpointRequest { boot_id, request } => {
-            classify_endpoint_request(boot_id, &request)
+            classify_endpoint_request(role, boot_id, &request)
         }
     }
 }
 
-fn classify_endpoint_request(boot_id: String, request: &str) -> Verdict {
+fn classify_endpoint_request(role: Role, boot_id: String, request: &str) -> Verdict {
     #[derive(serde::Deserialize)]
     struct Head {
         id: String,
@@ -130,14 +147,17 @@ fn classify_endpoint_request(boot_id: String, request: &str) -> Verdict {
     let Ok(head) = serde_json::from_str::<Head>(request) else {
         return Verdict::Close("invalid endpoint request".into());
     };
-    if VIEWER_ENDPOINT_METHODS.contains(&head.method.as_str()) {
+    let method = head.method.as_str();
+    if VIEWER_ENDPOINT_METHODS.contains(&method)
+        || (role == Role::Writer && WRITER_ENDPOINT_METHODS.contains(&method))
+    {
         return Verdict::Forward;
     }
     let reply = crate::server::client_commands::error_message(
         boot_id,
         head.id,
         "permission_denied",
-        format!("{} is not allowed for viewers", head.method),
+        format!("{} is not allowed for {}", head.method, role.as_str()),
     );
     Verdict::Reply(Box::new(reply), head.method)
 }
@@ -174,7 +194,10 @@ mod tests {
         let msg = ClientMessage::Input {
             data: b"rm -rf /\r".to_vec(),
         };
-        assert_eq!(classify_viewer_frame(&frame(&msg)), Verdict::Drop("input"));
+        assert_eq!(
+            classify_frame(Role::Viewer, &frame(&msg)),
+            Verdict::Drop("input")
+        );
     }
 
     #[test]
@@ -184,7 +207,7 @@ mod tests {
             takeover: true,
         };
         assert!(matches!(
-            classify_viewer_frame(&frame(&msg)),
+            classify_frame(Role::Viewer, &frame(&msg)),
             Verdict::Drop(_)
         ));
     }
@@ -195,7 +218,7 @@ mod tests {
             boot_id: "b".into(),
             request: r#"{"id":"r1","method":"pane.close","params":{}}"#.into(),
         };
-        match classify_viewer_frame(&frame(&msg)) {
+        match classify_frame(Role::Viewer, &frame(&msg)) {
             Verdict::Reply(reply, method) => {
                 assert_eq!(method, "pane.close");
                 assert!(matches!(
@@ -214,7 +237,7 @@ mod tests {
             boot_id: "b".into(),
             request: r#"{"id":"r1","method":"worktree.list","params":{}}"#.into(),
         };
-        assert_eq!(classify_viewer_frame(&frame(&msg)), Verdict::Forward);
+        assert_eq!(classify_frame(Role::Viewer, &frame(&msg)), Verdict::Forward);
     }
 
     #[test]
@@ -223,13 +246,60 @@ mod tests {
             kind: crate::protocol::endpoint::ENDPOINT_HELLO_KIND.into(),
             data: "{}".into(),
         };
-        assert_eq!(classify_viewer_frame(&frame(&hello)), Verdict::Forward);
+        assert_eq!(
+            classify_frame(Role::Viewer, &frame(&hello)),
+            Verdict::Forward
+        );
         let other = ClientMessage::EndpointControl {
             kind: "future.control".into(),
             data: String::new(),
         };
         assert!(matches!(
-            classify_viewer_frame(&frame(&other)),
+            classify_frame(Role::Viewer, &frame(&other)),
+            Verdict::Drop(_)
+        ));
+    }
+
+    #[test]
+    fn writer_can_type_but_not_close_panes() {
+        let input = ClientMessage::ClientShellPaneInput {
+            pane_id: "w1:p1".into(),
+            events: Vec::new(),
+        };
+        assert_eq!(
+            classify_frame(Role::Writer, &frame(&input)),
+            Verdict::Forward
+        );
+        let focus = ClientMessage::ClientShellEndpointRequest {
+            boot_id: "b".into(),
+            request: r#"{"id":"r1","method":"tab.focus","params":{}}"#.into(),
+        };
+        assert_eq!(
+            classify_frame(Role::Writer, &frame(&focus)),
+            Verdict::Forward
+        );
+        assert!(matches!(
+            classify_frame(Role::Viewer, &frame(&focus)),
+            Verdict::Reply(..)
+        ));
+        let close = ClientMessage::ClientShellEndpointRequest {
+            boot_id: "b".into(),
+            request: r#"{"id":"r2","method":"pane.close","params":{}}"#.into(),
+        };
+        assert!(matches!(
+            classify_frame(Role::Writer, &frame(&close)),
+            Verdict::Reply(..)
+        ));
+    }
+
+    #[test]
+    fn writer_cannot_take_over_terminal() {
+        let msg = ClientMessage::ControlTerminal {
+            target: "w1:p1".into(),
+            takeover: true,
+        };
+        assert!(matches!(
+            classify_frame(Role::Writer, &frame(&msg)),
             Verdict::Drop(_)
         ));
     }
@@ -238,6 +308,9 @@ mod tests {
     fn garbage_closes_connection() {
         let mut buf = 3u32.to_le_bytes().to_vec();
         buf.extend_from_slice(&[0xff, 0xff, 0xff]);
-        assert!(matches!(classify_viewer_frame(&buf), Verdict::Close(_)));
+        assert!(matches!(
+            classify_frame(Role::Viewer, &buf),
+            Verdict::Close(_)
+        ));
     }
 }

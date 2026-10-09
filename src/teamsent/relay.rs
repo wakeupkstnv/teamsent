@@ -89,7 +89,7 @@ async fn handle(tcp: TcpStream, rooms: Rooms) -> Result<(), String> {
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match parts.as_slice() {
         ["host", room] => host_control(ws, room, key, rooms).await,
-        ["join", room] => guest(ws, room, rooms).await,
+        ["join", room] => guest(ws, room, query, rooms).await,
         ["chan", room, chan] => host_channel(ws, room, chan, &key, rooms),
         _ => Err(format!("unknown route {path}")),
     }
@@ -135,7 +135,12 @@ async fn host_control(mut ws: Ws, room: &str, key: String, rooms: Rooms) -> Resu
     result
 }
 
-async fn guest(ws: Ws, room: &str, rooms: Rooms) -> Result<(), String> {
+/// The guest's query string (invite token, name, probe flag) is passed to the
+/// host untouched; the host alone decides whether and how the guest may join.
+async fn guest(ws: Ws, room: &str, query: &str, rooms: Rooms) -> Result<(), String> {
+    if query.contains(char::is_whitespace) {
+        return Err("invalid query".into());
+    }
     let chan = random_id();
     let (tx, rx) = oneshot::channel();
     {
@@ -146,7 +151,7 @@ async fn guest(ws: Ws, room: &str, rooms: Rooms) -> Result<(), String> {
         entry.pending.insert(chan.clone(), tx);
         entry
             .control
-            .send(format!("open {chan}"))
+            .send(format!("open {chan} {query}"))
             .map_err(|_| "host control closed".to_string())?;
     }
     let host_ws = match tokio::time::timeout(CHANNEL_OPEN_TIMEOUT, rx).await {
