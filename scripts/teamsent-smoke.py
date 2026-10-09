@@ -1,6 +1,6 @@
 """Teamsent smoke test: relay + host + view-only guest over a pty.
 
-usage: python3 -I teamsent-smoke.py <herdr-binary> <short-work-dir>
+usage: python3 -I scripts/teamsent-smoke.py target/debug/teamsent /tmp/ts-e2e
 The work dir must be short (unix socket paths are limited to ~104 bytes).
 """
 import json, os, pty, re, select, signal, struct, subprocess, sys, time, fcntl, termios

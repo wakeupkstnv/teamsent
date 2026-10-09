@@ -31,7 +31,7 @@ impl SessionConfig {
 
     fn session_dir(&self, name: &str) -> PathBuf {
         let app_dir = if cfg!(debug_assertions) {
-            "herdr-dev"
+            "teamsent-dev"
         } else {
             "herdr"
         };
@@ -46,7 +46,7 @@ impl SessionConfig {
     }
 
     fn delete(&self, name: &str) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_herdr"))
+        Command::new(env!("CARGO_BIN_EXE_teamsent"))
             .args(["session", "delete", name, "--json"])
             .env("XDG_CONFIG_HOME", &self.root)
             .env_remove("HERDR_SESSION")
