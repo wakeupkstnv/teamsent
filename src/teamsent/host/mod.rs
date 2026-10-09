@@ -154,10 +154,15 @@ pub(crate) fn run(args: &[String]) -> io::Result<()> {
     let options = parse_args(args)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("{err}\n{USAGE}")))?;
     ensure_server_running()?;
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(control_loop(options))
+        .build()?;
+    let result = runtime.block_on(control_loop(options));
+    // Don't wait for the blocking stdin reader: it never returns on its own, and
+    // waiting kept the process (and its control socket) alive after Ctrl+C.
+    runtime.shutdown_background();
+    let _ = std::fs::remove_file(super::host_control_socket_path());
+    result
 }
 
 fn parse_args(args: &[String]) -> Result<Options, String> {
@@ -1075,9 +1080,58 @@ fn close_team_pane() {
     }
 }
 
+/// Closes every pane whose foreground process is a Team window (`… team`),
+/// whichever teamsent version started it. Run before opening a new one.
+fn close_all_team_panes() -> usize {
+    let Ok(list) = queue::cli_json(&["pane", "list"]) else {
+        return 0;
+    };
+    let panes: Vec<String> = list["result"]["panes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p["pane_id"].as_str().map(str::to_string))
+        .collect();
+    let mut closed = 0;
+    for pane in panes {
+        let Ok(info) = queue::cli_json(&["pane", "process-info", "--pane", &pane]) else {
+            continue;
+        };
+        let is_team = info["result"]["process_info"]["foreground_processes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|proc| is_team_argv(&proc["argv"]));
+        if is_team && queue::cli(&["pane", "close", &pane]).is_ok() {
+            closed += 1;
+        }
+    }
+    closed
+}
+
+/// `teamsent team …` (or a renamed herdr binary running `team`).
+fn is_team_argv(argv: &serde_json::Value) -> bool {
+    let argv: Vec<&str> = argv
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| a.as_str())
+        .collect();
+    let program = argv
+        .first()
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    matches!(program, "teamsent" | "herdr") && argv.get(1) == Some(&"team")
+}
+
 /// Splits the agent pane and runs `teamsent team` on the right.
 fn open_team_pane(ctx: &Ctx) -> Result<String, String> {
     close_team_pane();
+    let stale = close_all_team_panes();
+    if stale > 0 {
+        eprintln!("closed {stale} old Team window(s)");
+    }
     let (agent, _) = queue::agent_pane(None)?;
     let split = queue::cli_json(&[
         "pane",
@@ -1236,6 +1290,23 @@ mod tests {
                 .await
                 .expect("revoke notifies live connections");
         });
+    }
+
+    #[test]
+    fn team_windows_are_recognised_by_argv() {
+        assert!(is_team_argv(&json!([
+            "/Users/x/.local/bin/teamsent",
+            "team"
+        ])));
+        assert!(is_team_argv(&json!([
+            "teamsent",
+            "team",
+            "--instance",
+            "ab"
+        ])));
+        assert!(!is_team_argv(&json!(["teamsent", "host"])));
+        assert!(!is_team_argv(&json!(["vim", "team"])));
+        assert!(!is_team_argv(&json!(["claude"])));
     }
 
     #[test]

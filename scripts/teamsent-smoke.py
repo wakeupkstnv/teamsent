@@ -289,6 +289,11 @@ try:
     code, out = run("join", m.group(1), timeout=10)
     checks["revoked link refused"] = code != 0 and "invite revoked" in out
 
+    # Restarting the host replaces old Team windows (any version) with exactly one.
+    split = json.loads(run("pane", "split", pane, "--direction", "down")[1])
+    run("pane", "run", split["result"]["pane"]["pane_id"], f"'{BIN}' team")
+    time.sleep(2)
+
     # A Team window from an earlier host run closes itself.
     count = lambda: run("pane", "list")[1].count('"pane_id"')
     before = count()
@@ -302,8 +307,16 @@ try:
     panes_before = run("pane", "list")[1].count('"pane_id"')
     host.send_signal(signal.SIGINT)
     wait_log(host_log, r"Stopped sharing", 10)
+    try:
+        host.wait(timeout=5)
+        checks["host process exits on Ctrl+C"] = True
+    except subprocess.TimeoutExpired:
+        checks["host process exits on Ctrl+C"] = False
     time.sleep(1)
     checks["team window closed on stop"] = run("pane", "list")[1].count('"pane_id"') == panes_before - 1
+    host2, host2_log = bg("host2", "host", "--relay", relay, stdin=subprocess.PIPE)
+    checks["restart closes old team windows"] = bool(wait_log(host2_log, r"closed 1 old Team window", 15))
+    checks["restart opens one team window"] = bool(wait_log(host2_log, r"Team window: pane", 10))
 finally:
     for g in guests:
         g.kill()
