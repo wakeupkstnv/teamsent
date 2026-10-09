@@ -4,7 +4,7 @@ usage: python3 -I scripts/teamsent-smoke.py target/debug/teamsent /tmp/ts-e2e
 The work dir must be short (unix socket paths are limited to ~104 bytes).
 Set TEAMSENT_RELAY=wss://… to test against a deployed relay instead of a local one.
 """
-import json, os, pty, re, select, signal, struct, subprocess, sys, time, fcntl, termios
+import json, os, pty, re, signal, struct, subprocess, sys, threading, time, fcntl, termios
 
 BIN, ROOT = sys.argv[1], sys.argv[2]
 PORT = "17878"
@@ -46,33 +46,63 @@ def focused_pane():
     return next(p["pane_id"] for p in json.loads(out)["result"]["panes"] if p["focused"])
 
 
+def team_state():
+    return run("team", "--once")[1]
+
+
+def team_send(cmd):
+    return run("team", "--send", json.dumps(cmd))
+
+
 def pane_text(pane):
     return run("pane", "read", pane, "--source", "recent", "--lines", "80")[1]
 
 
 class Guest:
+    """A `teamsent join` in a pty, read continuously so it never blocks on output."""
+
     def __init__(self, link, name):
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.execve(BIN, [BIN, "join", link, "--name", name], env)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
         self.closed = False
+        self.buf = b""
+        self.seen = 0
+        self.lock = threading.Lock()
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        while True:
+            try:
+                chunk = os.read(self.fd, 65536)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                self.closed = True
+                return
+            with self.lock:
+                self.buf += chunk
 
     def drain(self, seconds):
-        out = b""
-        end = time.time() + seconds
-        while time.time() < end and not self.closed:
-            r, _, _ = select.select([self.fd], [], [], 0.2)
-            if r:
-                try:
-                    chunk = os.read(self.fd, 65536)
-                except OSError:
-                    chunk = b""
-                if not chunk:
-                    self.closed = True
-                    break
-                out += chunk
+        """Output produced since the last call, after waiting `seconds`."""
+        time.sleep(seconds)
+        with self.lock:
+            out = self.buf[self.seen:]
+            self.seen = len(self.buf)
         return out
+
+    def wait_for(self, needle, seconds):
+        """True once `needle` appears in output produced from now on."""
+        start = self.seen
+        end = time.time() + seconds
+        while time.time() < end:
+            with self.lock:
+                if needle in self.buf[start:]:
+                    self.seen = len(self.buf)
+                    return True
+            time.sleep(0.2)
+        return False
 
     def type(self, data):
         try:
@@ -87,21 +117,20 @@ class Guest:
             if pid:
                 self.pid = None
                 return True
-            self.drain(0.2)
+            time.sleep(0.2)
         return False
 
     def kill(self):
-        # Close the pty first: a child blocked flushing tty output never finishes exiting.
-        try:
-            os.close(self.fd)
-        except OSError:
-            pass
         if self.pid:
             try:
                 os.kill(self.pid, signal.SIGKILL)
                 os.waitpid(self.pid, 0)
             except OSError:
                 pass
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
 
 
 checks = {}
@@ -123,6 +152,7 @@ try:
         host.stdin.flush()
         return wait_log(host_log, expect, timeout, start)
 
+    checks["team window opened"] = bool(wait_log(host_log, r"Team window: pane", 10))
     pane = focused_pane()
     run("pane", "run", pane, "echo TEAMSENT_$((40+2))_MARK")
     time.sleep(1)
@@ -134,9 +164,9 @@ try:
     # Viewer: sees everything, cannot type.
     viewer = Guest(viewer_link, "viewer1")
     guests.append(viewer)
-    checks["viewer sees host pane"] = b"TEAMSENT_42_MARK" in viewer.drain(6)
+    checks["viewer sees host pane"] = viewer.wait_for(b"TEAMSENT_42_MARK", 15)
     run("pane", "run", pane, "echo LIVE_$((5+5))_UPDATE")
-    checks["viewer sees live update"] = b"LIVE_10_UPDATE" in viewer.drain(3)
+    checks["viewer sees live update"] = viewer.wait_for(b"LIVE_10_UPDATE", 10)
     viewer.type(b"echo VIEWER_$((1+1))_INPUT\r")
     viewer.type(b"\x02c")  # prefix + c: try to create a tab
     viewer.drain(2)
@@ -156,11 +186,19 @@ try:
     writer.drain(2)
     checks["writer input reaches pane"] = "WRITER_7_INPUT" in pane_text(pane)
 
-    # /grant: the viewer becomes a writer without reconnecting.
+    # /grant: the viewer becomes a writer without reconnecting, but writer1 holds the floor.
     checks["/grant reported"] = bool(host_cmd("/grant 1 writer", r"#1 viewer1 is now writer"))
+    viewer.type(b"echo NOFLOOR_$((2+2))_INPUT\r")
+    viewer.drain(2)
+    checks["writer without floor blocked"] = "NOFLOOR_4_INPUT" not in pane_text(pane)
+    checks["/drive gives floor"] = bool(host_cmd("/drive 1", r"#1 viewer1 has the floor"))
     viewer.type(b"echo GRANTED_$((2+3))_INPUT\r")
     viewer.drain(2)
-    checks["granted viewer can type"] = "GRANTED_5_INPUT" in pane_text(pane)
+    checks["driver can type"] = "GRANTED_5_INPUT" in pane_text(pane)
+    writer.type(b"echo STOLEN_$((4+4))_INPUT\r")
+    writer.drain(2)
+    checks["other writer blocked while driving"] = "STOLEN_8_INPUT" not in pane_text(pane)
+    checks["team shows driver"] = "floor: viewer1" in team_state()
 
     # Suggestions: viewers cannot suggest; a participant's suggestion waits for /y.
     code, out = run("say", viewer_link, "--name", "viewer2", "echo NOPE", timeout=15)
@@ -185,6 +223,29 @@ try:
         time.sleep(1)
         checks["rejected never sent"] = "REJECTED_3" not in pane_text(pane)
     checks["audit has suggestion events"] = bool(host_cmd("/log 50", r"suggestion_sent"))
+
+    # Composer bar: Ctrl+] opens it, the draft is live in the Team window, Enter queues it.
+    composer = Guest(m_part.group(1), "barguest")
+    guests.append(composer)
+    composer.drain(4)
+    composer.type(b"\x1d")
+    composer.type("fix the flaky test".encode())
+    composer.drain(1.5)
+    state = team_state()
+    checks["team sees live draft"] = "barguest" in state and "typing: fix the flaky test" in state
+    composer.type(b"\r")
+    composer.drain(1.5)
+    qline = next((l for l in team_state().splitlines() if l.startswith("queue") and "fix the flaky test" in l), "")
+    checks["bar submit queued"] = "barguest#" in qline and "[pending]" in qline
+    qid = re.search(r"queue #(\d+)", qline)
+    if qid:
+        code, out = team_send({"cmd": "edit", "id": int(qid.group(1)), "text": "echo EDITED_$((7+7))"})
+        checks["team edit"] = code == 0
+        code, out = team_send({"cmd": "approve", "id": int(qid.group(1)), "pane": pane})
+        checks["team approve"] = code == 0 and "approved" in out
+        checks["team-approved delivered"] = bool(wait_log(host_log, rf"#{qid.group(1)} delivered", 15))
+        time.sleep(1)
+        checks["edited text ran"] = "EDITED_14" in pane_text(pane)
 
     # /revoke: the writer is kicked and its link stops working.
     checks["/revoke reported"] = bool(host_cmd("/revoke 2", r"invite \w+… revoked"))

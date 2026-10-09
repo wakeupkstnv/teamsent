@@ -4,11 +4,13 @@
 //! guest herdr client to it, `relay` pairs the two. See `design/herdr-recon.md`.
 
 mod audit;
+mod bar;
 mod filter;
 mod host;
 mod join;
 mod queue;
 mod say;
+mod team;
 
 use std::io;
 use std::time::Duration;
@@ -22,6 +24,7 @@ pub(crate) fn maybe_run(args: &[String]) -> Option<io::Result<()>> {
         "host" => Some(with_tls(|| host::run(rest))),
         "join" => Some(with_tls(|| join::run(rest))),
         "say" => Some(with_tls(|| say::run(rest))),
+        "team" => Some(team::run(rest)),
         "relay" => Some(teamsent_relay::run(rest)),
         _ => None,
     }
@@ -113,6 +116,11 @@ pub(crate) fn default_name() -> String {
         .ok()
         .filter(|n| is_valid_name(n))
         .unwrap_or_else(|| "guest".to_string())
+}
+
+/// Local socket the Team window uses to talk to `teamsent host`.
+pub(crate) fn host_control_socket_path() -> std::path::PathBuf {
+    crate::config::state_dir().join("host-control.sock")
 }
 
 /// 128-bit random id, hex encoded. Used for rooms, host keys and invite tokens.

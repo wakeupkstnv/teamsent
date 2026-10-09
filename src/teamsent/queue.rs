@@ -8,7 +8,7 @@
 //! suggestion goes out only after the previous turn finished. A pane without a
 //! detected agent gets the text as a plain command line.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex};
 
@@ -39,7 +39,7 @@ impl Status {
         )
     }
 
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         match self {
             Self::Pending => "pending".into(),
             Self::Approved { target } => format!("approved → {target}, waiting for agent"),
@@ -55,6 +55,8 @@ pub(crate) struct Suggestion {
     pub(crate) author: String,
     pub(crate) text: String,
     pub(crate) status: Status,
+    /// Guest ids who back this suggestion.
+    pub(crate) votes: BTreeSet<u32>,
 }
 
 #[derive(Default)]
@@ -74,6 +76,7 @@ impl Queue {
                 author: author.to_string(),
                 text: text.to_string(),
                 status: Status::Pending,
+                votes: BTreeSet::new(),
             },
         );
         self.next
@@ -104,6 +107,63 @@ impl Queue {
         }
         item.status = Status::Rejected;
         Ok(())
+    }
+
+    /// Replaces the text of a pending suggestion (the host tidies it up before sending).
+    pub(crate) fn edit(&mut self, id: u32, text: &str) -> Result<(), String> {
+        let item = self
+            .items
+            .get_mut(&id)
+            .ok_or(format!("no suggestion #{id}"))?;
+        if item.status != Status::Pending {
+            return Err(format!("#{id} is already {}", item.status.label()));
+        }
+        let text = text.trim();
+        if text.is_empty() || text.len() > MAX_SUGGESTION_BYTES {
+            return Err(format!("text must be 1-{MAX_SUGGESTION_BYTES} bytes"));
+        }
+        item.text = text.to_string();
+        Ok(())
+    }
+
+    /// Toggles `guest`'s vote on a pending suggestion; returns the new vote count.
+    pub(crate) fn vote(&mut self, id: u32, guest: u32) -> Result<usize, String> {
+        let item = self
+            .items
+            .get_mut(&id)
+            .ok_or(format!("no suggestion #{id}"))?;
+        if item.status != Status::Pending {
+            return Err(format!("#{id} is already {}", item.status.label()));
+        }
+        if !item.votes.remove(&guest) {
+            item.votes.insert(guest);
+        }
+        Ok(item.votes.len())
+    }
+
+    /// Open items and the last few finished ones, as JSON for UIs.
+    pub(crate) fn snapshot(&self) -> Vec<serde_json::Value> {
+        let done: Vec<u32> = self
+            .items
+            .iter()
+            .filter(|(_, s)| !s.status.is_open())
+            .map(|(id, _)| *id)
+            .collect();
+        let recent = &done[done.len().saturating_sub(RECENT_DONE)..];
+        self.items
+            .iter()
+            .filter(|(id, s)| s.status.is_open() || recent.contains(id))
+            .map(|(id, s)| {
+                json!({
+                    "id": id,
+                    "author": s.author,
+                    "text": s.text,
+                    "status": s.status.label(),
+                    "pending": s.status == Status::Pending,
+                    "votes": s.votes.len(),
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn set_status(&mut self, id: u32, status: Status) {
@@ -254,7 +314,7 @@ fn mark_sending(queue: &SharedQueue, job: &Job) {
 }
 
 /// Runs this binary's own CLI against the shared herdr server.
-fn cli(args: &[&str]) -> Result<String, String> {
+pub(crate) fn cli(args: &[&str]) -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let out = Command::new(exe)
         .args(args)
@@ -286,13 +346,36 @@ fn pane_agent_status(target: &str) -> Result<String, String> {
         .ok_or(format!("pane {target} not found"))
 }
 
-/// Default delivery target: the host's focused pane.
-pub(crate) fn focused_pane() -> Result<String, String> {
-    pane_list()?
+/// The pane suggestions go to and its agent status: the focused pane if it runs a
+/// detected agent, else the first pane that does, else the focused pane. `exclude`
+/// (the Team window) is never picked.
+pub(crate) fn agent_pane(exclude: Option<&str>) -> Result<(String, String), String> {
+    let panes = pane_list()?;
+    let usable: Vec<&serde_json::Value> = panes
         .iter()
-        .find(|p| p["focused"] == true)
-        .and_then(|p| p["pane_id"].as_str().map(str::to_string))
-        .ok_or("no focused pane".into())
+        .filter(|p| p["pane_id"].as_str() != exclude)
+        .collect();
+    let is_agent =
+        |p: &serde_json::Value| p["agent_status"].as_str().is_some_and(|s| s != "unknown");
+    let pick = usable
+        .iter()
+        .find(|p| p["focused"] == true && is_agent(p))
+        .or_else(|| usable.iter().find(|p| is_agent(p)))
+        .or_else(|| usable.iter().find(|p| p["focused"] == true))
+        .or_else(|| usable.first())
+        .ok_or("no pane to send to")?;
+    Ok((
+        pick["pane_id"].as_str().unwrap_or_default().to_string(),
+        pick["agent_status"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string(),
+    ))
+}
+
+/// Runs this binary's CLI and parses its JSON reply.
+pub(crate) fn cli_json(args: &[&str]) -> Result<serde_json::Value, String> {
+    serde_json::from_str(&cli(args)?).map_err(|e| e.to_string())
 }
 
 /// Pops a herdr notification in every attached client.
@@ -336,6 +419,25 @@ mod tests {
         let lines = q.lines();
         assert_eq!(lines.len(), RECENT_DONE + 1);
         assert!(lines.last().unwrap().contains(&format!("#{open}")));
+    }
+
+    #[test]
+    fn edit_and_vote_only_while_pending() {
+        let mut q = Queue::default();
+        let a = q.push("kolya", "add tests");
+        assert_eq!(q.vote(a, 2), Ok(1));
+        assert_eq!(q.vote(a, 3), Ok(2));
+        assert_eq!(
+            q.vote(a, 2),
+            Ok(1),
+            "second vote by the same guest toggles off"
+        );
+        assert_eq!(q.edit(a, "  add parser tests  "), Ok(()));
+        assert_eq!(q.snapshot()[0]["text"], "add parser tests");
+        assert!(q.edit(a, "").is_err());
+        q.approve(a, "w1:p1").unwrap();
+        assert!(q.edit(a, "late").is_err());
+        assert!(q.vote(a, 4).is_err());
     }
 
     #[test]

@@ -7,7 +7,12 @@
 //! filter, re-checked on every frame so `/grant` and `/revoke` apply at once.
 //!
 //! The host terminal accepts commands (see `HELP`): access control, the
-//! suggestion queue (`/q`, `/y`, `/n`) and the audit log (`/log`).
+//! suggestion queue (`/q`, `/y`, `/n`, `/e`), the floor (`/drive`, `/take`) and
+//! the audit log (`/log`). The same operations back the Team window
+//! (`control.rs`) and the guests' composer bar (`collab.rs`).
+
+mod collab;
+mod control;
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
@@ -34,10 +39,14 @@ use crate::protocol::{MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE};
 /// Team relay on GCP (deploy/README.md). Override with `--relay` or `TEAMSENT_RELAY`.
 const DEFAULT_RELAY: &str = "wss://34-38-17-92.sslip.io";
 const READ_CHUNK: usize = 64 * 1024;
-const USAGE: &str = "usage: teamsent host [--relay wss://HOST] [--role viewer|participant|writer] [--ttl 30m|2h|24h]";
+/// A driver who has not typed for this long loses the floor.
+const FLOOR_IDLE: Duration = Duration::from_secs(30);
+const USAGE: &str = "usage: teamsent host [--relay wss://HOST] [--role viewer|participant|writer] [--ttl 30m|2h|24h] [--no-team]";
 const ROLES: &str = "viewer, participant or writer";
 const HELP: &str = "\
 roles: viewer (watch) · participant (watch + suggest) · writer (type + suggest)
+Only one writer types at a time: whoever holds the floor (taken by typing when free,
+released after 30s idle, or given/taken by you).
 
 access:
   /list                      invites and guests
@@ -47,8 +56,12 @@ access:
 suggestions (guests send them with `teamsent say <link> <text>`):
   /q                         show the queue
   /y <#> [pane]              approve; delivered to the pane's agent when it is idle
-                             (default: your focused pane)
+                             (default: the focused agent pane)
+  /e <#> <text>              rewrite a pending suggestion before approving
   /n <#>                     reject
+floor:
+  /drive <guest#>            give the floor (makes the guest a writer)
+  /take                      take the floor back
 log:
   /log [n]                   last n audit entries (default 20)
   /help                      this text";
@@ -73,6 +86,12 @@ struct State {
     invites: HashMap<String, Invite>,
     guests: BTreeMap<u32, Guest>,
     next_guest: u32,
+    /// What each guest is typing in their composer right now.
+    drafts: HashMap<u32, String>,
+    /// The guest whose keystrokes reach panes, and when they last typed.
+    driver: Option<(u32, Instant)>,
+    /// The Team window's pane; guests may never type into it.
+    team_pane: Option<String>,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -83,6 +102,8 @@ struct Ctx {
     queue: SharedQueue,
     audit: Arc<Audit>,
     dispatch: std::sync::mpsc::Sender<Job>,
+    /// Agent pane and its status, refreshed every second.
+    agent: Mutex<(String, String)>,
 }
 
 impl Ctx {
@@ -95,6 +116,7 @@ impl Ctx {
             queue,
             audit,
             dispatch,
+            agent: Mutex::new((String::new(), "unknown".into())),
         }
     }
 }
@@ -103,6 +125,7 @@ struct Options {
     relay: String,
     role: Role,
     ttl: Duration,
+    team: bool,
 }
 
 pub(crate) fn run(args: &[String]) -> io::Result<()> {
@@ -123,9 +146,14 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             .to_string(),
         role: Role::Viewer,
         ttl: MAX_INVITE_TTL,
+        team: true,
     };
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
+        if flag == "--no-team" {
+            options.team = false;
+            continue;
+        }
         let value = iter.next().ok_or(format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--relay" => options.relay = value.trim_end_matches('/').to_string(),
@@ -149,7 +177,12 @@ fn ensure_server_running() -> io::Result<()> {
 }
 
 async fn control_loop(options: Options) -> io::Result<()> {
-    let Options { relay, role, ttl } = options;
+    let Options {
+        relay,
+        role,
+        ttl,
+        team,
+    } = options;
     let room = random_id();
     let key = random_id();
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("{relay}/host/{room}?key={key}"))
@@ -176,6 +209,17 @@ async fn control_loop(options: Options) -> io::Result<()> {
     eprintln!();
     eprintln!("Type /help for commands, Ctrl+C to stop sharing.");
     eprintln!("Audit log: {}", ctx.audit.path().display());
+    spawn_watcher(Arc::clone(&ctx));
+    match control::start(Arc::clone(&ctx)) {
+        Ok(()) if team => match open_team_pane(&ctx) {
+            Ok(pane) => eprintln!("Team window: pane {pane}"),
+            Err(err) => {
+                eprintln!("Team window not opened: {err} (run `teamsent team` in any pane)")
+            }
+        },
+        Ok(()) => {}
+        Err(err) => eprintln!("Team window unavailable: {err}"),
+    }
 
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     let mut stdin_open = true;
@@ -291,42 +335,26 @@ fn run_command(line: &str, ctx: &Ctx, relay: &str, room: &str) -> Vec<String> {
             revoke(state, id)
         }
         ["/q"] => ctx.queue.lock().unwrap().lines(),
-        ["/y", id, rest @ ..] if rest.len() <= 1 => {
-            let Some(id) = parse_guest_id(id) else {
-                return vec!["usage: /y <#> [pane]".into()];
-            };
-            let target = match rest.first() {
-                Some(pane) => pane.to_string(),
-                None => match queue::focused_pane() {
-                    Ok(pane) => pane,
-                    Err(err) => return vec![format!("cannot pick a pane: {err}")],
-                },
-            };
-            let text = match ctx.queue.lock().unwrap().approve(id, &target) {
-                Ok(text) => text,
-                Err(err) => return vec![err],
-            };
-            ctx.audit
-                .record("suggestion_approved", json!({ "id": id, "target": target }));
-            let _ = ctx.dispatch.send(Job {
-                id,
-                target: target.clone(),
-                text,
-            });
-            vec![format!("#{id} approved → {target}")]
-        }
-        ["/n", id] => {
-            let Some(id) = parse_guest_id(id) else {
-                return vec!["usage: /n <#>".into()];
-            };
-            match ctx.queue.lock().unwrap().reject(id) {
-                Ok(()) => {
-                    ctx.audit.record("suggestion_rejected", json!({ "id": id }));
-                    vec![format!("#{id} rejected")]
-                }
-                Err(err) => vec![err],
+        ["/y", id, rest @ ..] if rest.len() <= 1 => match parse_guest_id(id) {
+            Some(id) => vec![approve(ctx, id, rest.first().copied()).unwrap_or_else(|e| e)],
+            None => vec!["usage: /y <#> [pane]".into()],
+        },
+        ["/n", id] => match parse_guest_id(id) {
+            Some(id) => vec![reject(ctx, id).unwrap_or_else(|e| e)],
+            None => vec!["usage: /n <#>".into()],
+        },
+        ["/e", id, ..] => match parse_guest_id(id) {
+            Some(id) => {
+                let text = line.splitn(3, char::is_whitespace).nth(2).unwrap_or("");
+                vec![edit(ctx, id, text).unwrap_or_else(|e| e)]
             }
-        }
+            None => vec!["usage: /e <#> <text>".into()],
+        },
+        ["/drive", id] => match parse_guest_id(id) {
+            Some(id) => vec![give_floor(ctx, id).unwrap_or_else(|e| e)],
+            None => vec!["usage: /drive <guest#>".into()],
+        },
+        ["/take"] => vec![take_floor(ctx)],
         ["/log", rest @ ..] if rest.len() <= 1 => {
             let n = rest.first().and_then(|n| n.parse().ok()).unwrap_or(20);
             let lines = ctx.audit.tail(n);
@@ -399,6 +427,10 @@ fn revoke(state: &Shared, id: u32) -> Vec<String> {
         .collect();
     let mut out = Vec::new();
     for gid in ids {
+        state.drafts.remove(&gid);
+        if state.driver.is_some_and(|(d, _)| d == gid) {
+            state.driver = None;
+        }
         if let Some(guest) = state.guests.remove(&gid) {
             for kick in guest.conns.values() {
                 kick.notify_one();
@@ -466,6 +498,7 @@ async fn handle_open(url: String, chan: String, query: &str, ctx: Arc<Ctx>) -> i
     let state = &ctx.state;
     let probe = query_param(query, "probe") == Some("1");
     let say = query_param(query, "kind") == Some("say");
+    let collab = query_param(query, "kind") == Some("collab");
     let kick = Arc::new(Notify::new());
     let live = !probe && !say;
     let admitted = admit(state, query, &chan, live.then(|| Arc::clone(&kick)));
@@ -495,6 +528,15 @@ async fn handle_open(url: String, chan: String, query: &str, ctx: Arc<Ctx>) -> i
     if probe {
         let _ = ws.close(None).await;
         return Ok(());
+    }
+    if collab {
+        let result = collab::serve(ws, id, &ctx, &kick).await;
+        let mut st = state.lock().unwrap();
+        st.drafts.remove(&id);
+        if let Some(guest) = st.guests.get_mut(&id) {
+            guest.conns.remove(&chan);
+        }
+        return result;
     }
 
     let name = guest_name(state, id);
@@ -533,33 +575,14 @@ async fn receive_suggestion(
     ctx: &Ctx,
 ) -> io::Result<()> {
     let reply = if role == Role::Viewer {
-        "teamsent-denied viewers cannot suggest; ask the host for /grant".to_string()
+        format!("teamsent-denied {VIEWER_CANNOT_SUGGEST}")
     } else {
         let msg = tokio::time::timeout(Duration::from_secs(10), ws.next()).await;
         match msg {
-            Ok(Some(Ok(Message::Text(text)))) => {
-                let text = text.trim();
-                if text.is_empty() || text.len() > MAX_SUGGESTION_BYTES {
-                    format!("teamsent-denied suggestion must be 1-{MAX_SUGGESTION_BYTES} bytes")
-                } else {
-                    let name = guest_name(&ctx.state, id);
-                    let author = format!("{name}#{id}");
-                    let sid = ctx.queue.lock().unwrap().push(&author, text);
-                    eprintln!("\x07#{sid} from {author}: {}", queue::one_line(text, 200));
-                    eprintln!(
-                        "     /y {sid} to send to your focused pane's agent, /n {sid} to reject"
-                    );
-                    ctx.audit.record(
-                        "suggestion",
-                        json!({ "id": sid, "guest": id, "name": name, "text": text }),
-                    );
-                    queue::notify(
-                        &format!("teamsent: {name} suggests #{sid}"),
-                        &queue::one_line(text, 120),
-                    );
-                    format!("teamsent-queued {sid}")
-                }
-            }
+            Ok(Some(Ok(Message::Text(text)))) => match submit(ctx, id, &text) {
+                Ok(sid) => format!("teamsent-queued {sid}"),
+                Err(err) => format!("teamsent-denied {err}"),
+            },
             _ => "teamsent-denied no suggestion received".to_string(),
         }
     };
@@ -588,6 +611,7 @@ fn connection_count(state: &Shared, id: u32) -> usize {
 }
 
 /// The guest's current role, or `None` once the guest was revoked.
+#[cfg(test)]
 fn current_role(state: &Shared, id: u32) -> Option<Role> {
     state.lock().unwrap().guests.get(&id).map(|g| g.role)
 }
@@ -666,10 +690,21 @@ async fn pump(
                 Err(err) => return Err(io::Error::other(err)),
             };
             for frame in frames {
-                let Some(role) = current_role(state, id) else {
+                let Some(access) = access_for(state, id, filter::is_input_frame(&frame)) else {
                     return Ok(());
                 };
-                match filter::classify_frame(role, &frame) {
+                let verdict = {
+                    let team_pane = access.1.as_deref();
+                    filter::classify_frame(
+                        filter::Access {
+                            role: access.0,
+                            may_type: access.2,
+                            host_only_pane: team_pane,
+                        },
+                        &frame,
+                    )
+                };
+                match verdict {
                     Verdict::Forward => {
                         if to_server_tx.send(frame).is_err() {
                             return Ok(());
@@ -700,6 +735,220 @@ async fn pump(
     };
     shutdown_local_stream(&socket);
     result
+}
+
+const VIEWER_CANNOT_SUGGEST: &str = "viewers cannot suggest; ask the host for /grant";
+
+/// Role, Team pane and whether this frame may type, for one guest frame.
+/// Typing by a writer claims a free floor and refreshes a held one.
+/// `None` once the guest was revoked.
+fn access_for(state: &Shared, id: u32, is_input: bool) -> Option<(Role, Option<String>, bool)> {
+    let mut st = state.lock().unwrap();
+    let role = st.guests.get(&id)?.role;
+    let mut may_type = false;
+    if role == Role::Writer {
+        match st.driver {
+            None if is_input => {
+                st.driver = Some((id, Instant::now()));
+                let name = st.guests[&id].name.clone();
+                eprintln!("#{id} {name} took the floor");
+                may_type = true;
+            }
+            Some((driver, _)) if driver == id => {
+                if is_input {
+                    st.driver = Some((id, Instant::now()));
+                }
+                may_type = true;
+            }
+            _ => {}
+        }
+    }
+    Some((role, st.team_pane.clone(), may_type))
+}
+
+/// Queues a guest's suggestion and tells the host.
+fn submit(ctx: &Ctx, id: u32, text: &str) -> Result<u32, String> {
+    let (name, role) = {
+        let st = ctx.state.lock().unwrap();
+        let guest = st.guests.get(&id).ok_or("unknown guest")?;
+        (guest.name.clone(), guest.role)
+    };
+    if role == Role::Viewer {
+        return Err(VIEWER_CANNOT_SUGGEST.into());
+    }
+    let text = text.trim();
+    if text.is_empty() || text.len() > MAX_SUGGESTION_BYTES {
+        return Err(format!("suggestion must be 1-{MAX_SUGGESTION_BYTES} bytes"));
+    }
+    let author = format!("{name}#{id}");
+    let sid = ctx.queue.lock().unwrap().push(&author, text);
+    ctx.state.lock().unwrap().drafts.remove(&id);
+    eprintln!("\x07#{sid} from {author}: {}", queue::one_line(text, 200));
+    eprintln!("     /y {sid} to send to the agent, /e {sid} <text> to edit, /n {sid} to reject");
+    ctx.audit.record(
+        "suggestion",
+        json!({ "id": sid, "guest": id, "name": name, "text": text }),
+    );
+    queue::notify(
+        &format!("teamsent: {name} suggests #{sid}"),
+        &queue::one_line(text, 120),
+    );
+    Ok(sid)
+}
+
+fn approve(ctx: &Ctx, sid: u32, pane: Option<&str>) -> Result<String, String> {
+    let target = match pane {
+        Some(pane) => pane.to_string(),
+        None => {
+            let team = ctx.state.lock().unwrap().team_pane.clone();
+            queue::agent_pane(team.as_deref())
+                .map_err(|err| format!("cannot pick a pane: {err}"))?
+                .0
+        }
+    };
+    let text = ctx.queue.lock().unwrap().approve(sid, &target)?;
+    ctx.audit.record(
+        "suggestion_approved",
+        json!({ "id": sid, "target": target }),
+    );
+    let _ = ctx.dispatch.send(Job {
+        id: sid,
+        target: target.clone(),
+        text,
+    });
+    Ok(format!("#{sid} approved → {target}"))
+}
+
+fn reject(ctx: &Ctx, sid: u32) -> Result<String, String> {
+    ctx.queue.lock().unwrap().reject(sid)?;
+    ctx.audit
+        .record("suggestion_rejected", json!({ "id": sid }));
+    Ok(format!("#{sid} rejected"))
+}
+
+fn edit(ctx: &Ctx, sid: u32, text: &str) -> Result<String, String> {
+    ctx.queue.lock().unwrap().edit(sid, text)?;
+    ctx.audit.record(
+        "suggestion_edited",
+        json!({ "id": sid, "text": text.trim() }),
+    );
+    Ok(format!("#{sid} edited"))
+}
+
+/// Gives the floor to a guest, promoting them to writer if needed.
+fn give_floor(ctx: &Ctx, id: u32) -> Result<String, String> {
+    let name = {
+        let mut st = ctx.state.lock().unwrap();
+        let guest = st.guests.get_mut(&id).ok_or(format!("no guest #{id}"))?;
+        guest.role = Role::Writer;
+        let name = guest.name.clone();
+        st.driver = Some((id, Instant::now()));
+        name
+    };
+    ctx.audit
+        .record("floor_given", json!({ "guest": id, "name": name }));
+    queue::notify(
+        &format!("teamsent: {name} is driving"),
+        "the host gave them the floor",
+    );
+    Ok(format!("#{id} {name} has the floor"))
+}
+
+fn take_floor(ctx: &Ctx) -> String {
+    let taken = ctx.state.lock().unwrap().driver.take();
+    match taken {
+        Some((id, _)) => {
+            ctx.audit.record("floor_taken", json!({ "guest": id }));
+            format!("floor taken back from #{id}")
+        }
+        None => "nobody has the floor".into(),
+    }
+}
+
+/// Session state as JSON for the Team window (`me = None`) and guest bars.
+fn snapshot(ctx: &Ctx, me: Option<u32>) -> serde_json::Value {
+    let (agent_pane, agent_status) = ctx.agent.lock().unwrap().clone();
+    let queue = ctx.queue.lock().unwrap().snapshot();
+    let st = ctx.state.lock().unwrap();
+    let driver = st.driver.map(|(id, _)| id);
+    let mut people = vec![json!({
+        "id": 0, "name": "host", "role": "host", "online": true, "draft": "", "driving": false,
+    })];
+    people.extend(st.guests.iter().map(|(id, g)| {
+        json!({
+            "id": id,
+            "name": g.name,
+            "role": g.role.as_str(),
+            "online": !g.conns.is_empty(),
+            "draft": st.drafts.get(id).cloned().unwrap_or_default(),
+            "driving": driver == Some(*id),
+        })
+    }));
+    let me = me.and_then(|id| {
+        st.guests.get(&id).map(|g| {
+            json!({ "id": id, "name": g.name, "role": g.role.as_str(), "driving": driver == Some(id) })
+        })
+    });
+    json!({
+        "t": "state",
+        "me": me,
+        "people": people,
+        "agent": { "pane": agent_pane, "status": agent_status },
+        "queue": queue,
+        "driver": driver.and_then(|id| st.guests.get(&id).map(|g| g.name.clone())),
+        "team_pane": st.team_pane,
+    })
+}
+
+/// Refreshes the agent pane/status every second and releases an idle floor.
+fn spawn_watcher(ctx: Arc<Ctx>) {
+    std::thread::spawn(move || loop {
+        let team = ctx.state.lock().unwrap().team_pane.clone();
+        if let Ok(agent) = queue::agent_pane(team.as_deref()) {
+            *ctx.agent.lock().unwrap() = agent;
+        }
+        let released = {
+            let mut st = ctx.state.lock().unwrap();
+            match st.driver {
+                Some((id, last)) if last.elapsed() >= FLOOR_IDLE => {
+                    st.driver = None;
+                    Some(id)
+                }
+                _ => None,
+            }
+        };
+        if let Some(id) = released {
+            eprintln!("#{id} released the floor (idle)");
+            ctx.audit.record("floor_released", json!({ "guest": id }));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    });
+}
+
+/// Splits the agent pane and runs `teamsent team` on the right.
+fn open_team_pane(ctx: &Ctx) -> Result<String, String> {
+    let (agent, _) = queue::agent_pane(None)?;
+    let split = queue::cli_json(&[
+        "pane",
+        "split",
+        &agent,
+        "--direction",
+        "right",
+        "--ratio",
+        "0.7",
+    ])?;
+    let pane = split["result"]["pane"]["pane_id"]
+        .as_str()
+        .ok_or("split returned no pane")?
+        .to_string();
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let command = format!(
+        "'{}' team",
+        exe.display().to_string().replace('\'', "'\\''")
+    );
+    queue::cli(&["pane", "run", &pane, &command])?;
+    ctx.state.lock().unwrap().team_pane = Some(pane.clone());
+    Ok(pane)
 }
 
 fn fmt_duration(d: Duration) -> String {

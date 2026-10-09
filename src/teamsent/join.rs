@@ -24,22 +24,31 @@ const ACCEPT_POLL: Duration = Duration::from_millis(20);
 const READ_CHUNK: usize = 64 * 1024;
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 
-const USAGE: &str = "usage: teamsent join ws://HOST:PORT/join/ROOM/TOKEN [--name NAME]";
+const USAGE: &str = "usage: teamsent join <link> [--name NAME] [--no-bar]";
 
 pub(crate) fn run(args: &[String]) -> io::Result<()> {
     let usage = |msg: &str| io::Error::new(io::ErrorKind::InvalidInput, format!("{msg}{USAGE}"));
-    let (link, name) = match args {
-        [link] => (link, default_name()),
-        [link, flag, name] if flag == "--name" => {
-            if !is_valid_name(name) {
-                return Err(usage(
-                    "name must be 1-32 chars of a-z, 0-9, '-', '_', '.'\n",
-                ));
+    let (link, rest) = args.split_first().ok_or_else(|| usage(""))?;
+    let mut name = default_name();
+    let mut with_bar = true;
+    let mut rest = rest.iter();
+    while let Some(flag) = rest.next() {
+        match flag.as_str() {
+            "--name" => {
+                name = rest
+                    .next()
+                    .ok_or_else(|| usage("--name needs a value\n"))?
+                    .clone();
+                if !is_valid_name(&name) {
+                    return Err(usage(
+                        "name must be 1-32 chars of a-z, 0-9, '-', '_', '.'\n",
+                    ));
+                }
             }
-            (link, name.clone())
+            "--no-bar" => with_bar = false,
+            _ => return Err(usage("")),
         }
-        _ => return Err(usage("")),
-    };
+    }
     if !is_join_link(link) {
         return Err(usage("not a teamsent invite link\n"));
     }
@@ -89,7 +98,11 @@ pub(crate) fn run(args: &[String]) -> io::Result<()> {
         }
     });
 
-    let status = run_client(&socket_path);
+    let status = if with_bar {
+        super::bar::run_client(&socket_path, &link, runtime.handle())
+    } else {
+        run_client(&socket_path)
+    };
 
     stop.store(true, Ordering::Release);
     let _ = accept_thread.join();

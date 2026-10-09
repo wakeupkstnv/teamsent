@@ -39,6 +39,51 @@ const CLIENT_ENDPOINT_CONTROL_KINDS: &[&str] = &[
     crate::protocol::endpoint::HEALTH_PING_KIND,
 ];
 
+/// What one guest may do right now.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Access<'a> {
+    pub(crate) role: Role,
+    /// Whether keystrokes and mouse input may reach panes (the guest holds the floor).
+    pub(crate) may_type: bool,
+    /// A pane only the host may type into (the Team window).
+    pub(crate) host_only_pane: Option<&'a str>,
+}
+
+#[cfg(test)]
+impl Access<'_> {
+    pub(crate) fn role(role: Role) -> Self {
+        Self {
+            role,
+            may_type: role == Role::Writer,
+            host_only_pane: None,
+        }
+    }
+}
+
+/// Whether a decoded guest frame carries input (keys or mouse) for a pane.
+pub(crate) fn is_input_frame(frame: &[u8]) -> bool {
+    use ClientMessage as M;
+    matches!(
+        decode(frame),
+        Ok(M::Input { .. }
+            | M::ClientShellPaneInput { .. }
+            | M::ClientShellPopupInput { .. }
+            | M::AttachMouse { .. })
+    )
+}
+
+fn decode(frame: &[u8]) -> Result<ClientMessage, Verdict> {
+    let payload = &frame[LENGTH_PREFIX_BYTES..];
+    if payload.len() > MAX_FRAME_SIZE {
+        return Err(Verdict::Close("oversized frame".into()));
+    }
+    match bincode::serde::decode_from_slice(payload, bincode::config::standard()) {
+        Ok((msg, consumed)) if consumed == payload.len() => Ok(msg),
+        Ok(_) => Err(Verdict::Close("trailing bytes in frame".into())),
+        Err(err) => Err(Verdict::Close(format!("undecodable frame: {err}"))),
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Verdict {
     /// Forward the frame to the herdr server unchanged.
@@ -84,22 +129,16 @@ pub(crate) fn encode_frame(msg: &ServerMessage) -> Vec<u8> {
 }
 
 /// Decides what to do with one complete guest frame (prefix included).
-pub(crate) fn classify_frame(role: Role, frame: &[u8]) -> Verdict {
-    let payload = &frame[LENGTH_PREFIX_BYTES..];
-    if payload.len() > MAX_FRAME_SIZE {
-        return Verdict::Close("oversized frame".into());
+pub(crate) fn classify_frame(access: Access<'_>, frame: &[u8]) -> Verdict {
+    match decode(frame) {
+        Ok(msg) => classify(access, msg),
+        Err(verdict) => verdict,
     }
-    let msg: ClientMessage =
-        match bincode::serde::decode_from_slice(payload, bincode::config::standard()) {
-            Ok((msg, consumed)) if consumed == payload.len() => msg,
-            Ok(_) => return Verdict::Close("trailing bytes in frame".into()),
-            Err(err) => return Verdict::Close(format!("undecodable frame: {err}")),
-        };
-    classify(role, msg)
 }
 
-fn classify(role: Role, msg: ClientMessage) -> Verdict {
+fn classify(access: Access<'_>, msg: ClientMessage) -> Verdict {
     use ClientMessage as M;
+    let role = access.role;
     match msg {
         M::TerminalHello { .. }
         | M::ClientShellHello { .. }
@@ -114,13 +153,21 @@ fn classify(role: Role, msg: ClientMessage) -> Verdict {
         | M::GraphicsTransmissionResult { .. }
         | M::GraphicsTransmissionStarted { .. } => Verdict::Forward,
 
+        M::ClientShellPaneInput { pane_id, .. }
+            if access.host_only_pane == Some(pane_id.as_str()) =>
+        {
+            Verdict::Drop("host-only pane")
+        }
         M::Input { .. }
         | M::ClientShellPaneInput { .. }
         | M::ClientShellPopupInput { .. }
-        | M::AttachMouse { .. } => match role {
-            Role::Writer => Verdict::Forward,
-            Role::Viewer | Role::Participant => Verdict::Drop("input"),
-        },
+        | M::AttachMouse { .. } => {
+            if access.may_type {
+                Verdict::Forward
+            } else {
+                Verdict::Drop("input")
+            }
+        }
 
         M::AttachTerminal { .. } | M::ControlTerminal { .. } => Verdict::Drop("terminal control"),
         M::ClipboardImage { .. } => Verdict::Drop("clipboard"),
@@ -195,7 +242,7 @@ mod tests {
             data: b"rm -rf /\r".to_vec(),
         };
         assert_eq!(
-            classify_frame(Role::Viewer, &frame(&msg)),
+            classify_frame(Access::role(Role::Viewer), &frame(&msg)),
             Verdict::Drop("input")
         );
     }
@@ -207,7 +254,7 @@ mod tests {
             takeover: true,
         };
         assert!(matches!(
-            classify_frame(Role::Viewer, &frame(&msg)),
+            classify_frame(Access::role(Role::Viewer), &frame(&msg)),
             Verdict::Drop(_)
         ));
     }
@@ -218,7 +265,7 @@ mod tests {
             boot_id: "b".into(),
             request: r#"{"id":"r1","method":"pane.close","params":{}}"#.into(),
         };
-        match classify_frame(Role::Viewer, &frame(&msg)) {
+        match classify_frame(Access::role(Role::Viewer), &frame(&msg)) {
             Verdict::Reply(reply, method) => {
                 assert_eq!(method, "pane.close");
                 assert!(matches!(
@@ -237,7 +284,10 @@ mod tests {
             boot_id: "b".into(),
             request: r#"{"id":"r1","method":"worktree.list","params":{}}"#.into(),
         };
-        assert_eq!(classify_frame(Role::Viewer, &frame(&msg)), Verdict::Forward);
+        assert_eq!(
+            classify_frame(Access::role(Role::Viewer), &frame(&msg)),
+            Verdict::Forward
+        );
     }
 
     #[test]
@@ -247,7 +297,7 @@ mod tests {
             data: "{}".into(),
         };
         assert_eq!(
-            classify_frame(Role::Viewer, &frame(&hello)),
+            classify_frame(Access::role(Role::Viewer), &frame(&hello)),
             Verdict::Forward
         );
         let other = ClientMessage::EndpointControl {
@@ -255,7 +305,7 @@ mod tests {
             data: String::new(),
         };
         assert!(matches!(
-            classify_frame(Role::Viewer, &frame(&other)),
+            classify_frame(Access::role(Role::Viewer), &frame(&other)),
             Verdict::Drop(_)
         ));
     }
@@ -267,7 +317,7 @@ mod tests {
             events: Vec::new(),
         };
         assert_eq!(
-            classify_frame(Role::Writer, &frame(&input)),
+            classify_frame(Access::role(Role::Writer), &frame(&input)),
             Verdict::Forward
         );
         let focus = ClientMessage::ClientShellEndpointRequest {
@@ -275,11 +325,11 @@ mod tests {
             request: r#"{"id":"r1","method":"tab.focus","params":{}}"#.into(),
         };
         assert_eq!(
-            classify_frame(Role::Writer, &frame(&focus)),
+            classify_frame(Access::role(Role::Writer), &frame(&focus)),
             Verdict::Forward
         );
         assert!(matches!(
-            classify_frame(Role::Viewer, &frame(&focus)),
+            classify_frame(Access::role(Role::Viewer), &frame(&focus)),
             Verdict::Reply(..)
         ));
         let close = ClientMessage::ClientShellEndpointRequest {
@@ -287,7 +337,7 @@ mod tests {
             request: r#"{"id":"r2","method":"pane.close","params":{}}"#.into(),
         };
         assert!(matches!(
-            classify_frame(Role::Writer, &frame(&close)),
+            classify_frame(Access::role(Role::Writer), &frame(&close)),
             Verdict::Reply(..)
         ));
     }
@@ -299,9 +349,50 @@ mod tests {
             takeover: true,
         };
         assert!(matches!(
-            classify_frame(Role::Writer, &frame(&msg)),
+            classify_frame(Access::role(Role::Writer), &frame(&msg)),
             Verdict::Drop(_)
         ));
+    }
+
+    #[test]
+    fn writer_without_floor_cannot_type() {
+        let input = ClientMessage::ClientShellPaneInput {
+            pane_id: "w1:p1".into(),
+            events: Vec::new(),
+        };
+        let no_floor = Access {
+            role: Role::Writer,
+            may_type: false,
+            host_only_pane: None,
+        };
+        assert_eq!(
+            classify_frame(no_floor, &frame(&input)),
+            Verdict::Drop("input")
+        );
+        assert!(is_input_frame(&frame(&input)));
+        assert!(!is_input_frame(&frame(&ClientMessage::Detach)));
+    }
+
+    #[test]
+    fn driver_cannot_type_into_host_only_pane() {
+        let driver = Access {
+            role: Role::Writer,
+            may_type: true,
+            host_only_pane: Some("w1:p2"),
+        };
+        let team = ClientMessage::ClientShellPaneInput {
+            pane_id: "w1:p2".into(),
+            events: Vec::new(),
+        };
+        let agent = ClientMessage::ClientShellPaneInput {
+            pane_id: "w1:p1".into(),
+            events: Vec::new(),
+        };
+        assert_eq!(
+            classify_frame(driver, &frame(&team)),
+            Verdict::Drop("host-only pane")
+        );
+        assert_eq!(classify_frame(driver, &frame(&agent)), Verdict::Forward);
     }
 
     #[test]
@@ -309,7 +400,7 @@ mod tests {
         let mut buf = 3u32.to_le_bytes().to_vec();
         buf.extend_from_slice(&[0xff, 0xff, 0xff]);
         assert!(matches!(
-            classify_frame(Role::Viewer, &buf),
+            classify_frame(Access::role(Role::Viewer), &buf),
             Verdict::Close(_)
         ));
     }
