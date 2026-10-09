@@ -6,7 +6,9 @@
 //!
 //! Commands: `{"cmd":"approve","id",["pane"]}`, `{"cmd":"reject","id"}`,
 //! `{"cmd":"edit","id","text"}`, `{"cmd":"drive","guest"}`, `{"cmd":"take"}`,
-//! `{"cmd":"role","guest","role"}`, `{"cmd":"kick","guest"}`.
+//! `{"cmd":"role","guest","role"}`, `{"cmd":"kick","guest"}`,
+//! `{"cmd":"prompt","text"}`, `{"cmd":"move","id","delta"}`, `{"cmd":"clear"}`,
+//! `{"cmd":"pause","paused"}`, `{"cmd":"auto","on"}`, `{"cmd":"names","on"}`.
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::sync::{Arc, Mutex};
@@ -16,7 +18,10 @@ use interprocess::local_socket::traits::Listener as _;
 use interprocess::TryClone as _;
 use serde_json::{json, Value};
 
-use super::{approve, edit, give_floor, grant, kick, reject, snapshot, take_floor, Ctx};
+use super::{
+    approve, clear_queue, edit, give_floor, grant, host_prompt, kick, move_prompt, reject,
+    set_auto, set_names, set_paused, snapshot, take_floor, Ctx,
+};
 use crate::teamsent::host_control_socket_path;
 use crate::teamsent::Role;
 
@@ -95,6 +100,12 @@ fn run(ctx: &Ctx, cmd: &Value) -> Result<String, String> {
         "edit" => edit(ctx, id()?, cmd["text"].as_str().unwrap_or_default()),
         "drive" => give_floor(ctx, guest()?),
         "take" => Ok(take_floor(ctx)),
+        "prompt" => host_prompt(ctx, cmd["text"].as_str().unwrap_or_default()),
+        "move" => move_prompt(ctx, id()?, cmd["delta"].as_i64().unwrap_or(0) as i32),
+        "clear" => Ok(clear_queue(ctx)),
+        "pause" => Ok(set_paused(ctx, cmd["paused"].as_bool().unwrap_or(true))),
+        "auto" => Ok(set_auto(ctx, cmd["on"].as_bool().unwrap_or(true))),
+        "names" => Ok(set_names(ctx, cmd["on"].as_bool().unwrap_or(true))),
         "role" => {
             let role = cmd["role"]
                 .as_str()

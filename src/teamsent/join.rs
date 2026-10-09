@@ -141,6 +141,7 @@ fn run_client(socket_path: &Path) -> io::Result<()> {
             socket_path,
         )
         .env_remove(crate::api::SOCKET_PATH_ENV_VAR)
+        .env(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR, "local")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

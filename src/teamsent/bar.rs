@@ -171,14 +171,18 @@ struct Bar {
 impl Bar {
     fn line(&self) -> String {
         if let Some(text) = &self.composer {
-            let hint = "  Enter send · Esc cancel";
+            let hint = if self.state["mode"] == "auto" {
+                "  Enter queue for the agent · Esc cancel"
+            } else {
+                "  Enter send to host · Esc cancel"
+            };
             let room = (self.cols as usize).saturating_sub(12 + hint.len());
             let shown: String = {
                 let chars: Vec<char> = text.chars().collect();
                 let skip = chars.len().saturating_sub(room);
                 chars[skip..].iter().collect()
             };
-            return format!(" suggest › {shown}▏{hint}");
+            return format!(" prompt › {shown}▏{hint}");
         }
         if let Some((msg, at)) = &self.flash {
             if at.elapsed() < FLASH_FOR {
@@ -194,9 +198,27 @@ impl Bar {
         let online = s["people"]
             .as_array()
             .map_or(0, |p| p.iter().filter(|p| p["online"] == true).count());
-        let pending = s["queue"]
+        let queue: Vec<&Value> = s["queue"]
             .as_array()
-            .map_or(0, |q| q.iter().filter(|q| q["pending"] == true).count());
+            .map(|q| q.iter().filter(|q| q["waiting"] == true).collect())
+            .unwrap_or_default();
+        let mine = format!("#{}", me["id"]);
+        let my_places: Vec<String> = queue
+            .iter()
+            .filter(|q| q["author"].as_str().is_some_and(|a| a.ends_with(&mine)))
+            .filter_map(|q| q["position"].as_u64().map(|p| format!("{p}")))
+            .collect();
+        let mode = if s["mode"] == "auto" {
+            "auto"
+        } else {
+            "host reviews"
+        };
+        let paused = if s["paused"] == true { " ⏸" } else { "" };
+        let pending = if my_places.is_empty() {
+            format!("queue {}", queue.len())
+        } else {
+            format!("queue {} (yours: {})", queue.len(), my_places.join(","))
+        };
         let floor = if me["driving"] == true {
             " · 🚗 you drive".to_string()
         } else {
@@ -208,10 +230,10 @@ impl Bar {
         let action = if role == "viewer" {
             "view only"
         } else {
-            "⌃] suggest"
+            "⌃] prompt the agent"
         };
         format!(
-            " teamsent · {} ({role}) · {online} online · agent: {} · queue {pending}{floor} · {action}",
+            " teamsent · {} ({role}) · {online} online · agent: {} · {pending} · {mode}{paused}{floor} · {action}",
             me["name"].as_str().unwrap_or("?"),
             s["agent"]["status"].as_str().unwrap_or("?"),
         )
@@ -368,6 +390,8 @@ pub(crate) fn run_client(
         socket_path,
     );
     cmd.env_remove(crate::api::SOCKET_PATH_ENV_VAR);
+    // Behave like `herdr --remote`: local keybindings, remote timeouts, no file graphics.
+    cmd.env(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR, "local");
     if let Ok(cwd) = std::env::current_dir() {
         cmd.cwd(cwd);
     }
@@ -708,10 +732,14 @@ mod tests {
     fn bar_line_shows_role_queue_and_floor() {
         let bar = Bar {
             state: json!({
-                "me": { "name": "kolya", "role": "participant", "driving": false },
+                "me": { "id": 2, "name": "kolya", "role": "participant", "driving": false },
+                "mode": "auto",
                 "people": [ { "online": true }, { "online": true }, { "online": false } ],
                 "agent": { "status": "working" },
-                "queue": [ { "pending": true }, { "pending": false } ],
+                "queue": [
+                    { "waiting": true, "author": "kolya#2", "position": 1 },
+                    { "waiting": false, "author": "asel#3" },
+                ],
                 "driver": "asel",
             }),
             composer: None,
@@ -723,7 +751,8 @@ mod tests {
         assert!(line.contains("kolya (participant)"));
         assert!(line.contains("2 online"));
         assert!(line.contains("agent: working"));
-        assert!(line.contains("queue 1"));
+        assert!(line.contains("queue 1 (yours: 1)"));
+        assert!(line.contains("auto"));
         assert!(line.contains("🚗 asel"));
         assert!(bar.paint().starts_with("\x1b7\x1b[40;1H"));
     }

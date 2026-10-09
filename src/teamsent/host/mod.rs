@@ -16,6 +16,7 @@ mod control;
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,7 +30,7 @@ use serde_json::json;
 
 use super::audit::Audit;
 use super::filter::{self, Verdict};
-use super::queue::{self, Job, SharedQueue, MAX_SUGGESTION_BYTES};
+use super::queue::{self, SharedQueue, MAX_SUGGESTION_BYTES};
 use super::{
     is_valid_name, parse_ttl, query_param, random_id, shutdown_local_stream, Role, MAX_INVITE_TTL,
     PROTOCOL_TAG,
@@ -41,7 +42,7 @@ const DEFAULT_RELAY: &str = "wss://34-38-17-92.sslip.io";
 const READ_CHUNK: usize = 64 * 1024;
 /// A driver who has not typed for this long loses the floor.
 const FLOOR_IDLE: Duration = Duration::from_secs(30);
-const USAGE: &str = "usage: teamsent host [--relay wss://HOST] [--role viewer|participant|writer] [--ttl 30m|2h|24h] [--no-team]";
+const USAGE: &str = "usage: teamsent host [--relay wss://HOST] [--role viewer|participant|writer] [--ttl 30m|2h|24h] [--auto] [--no-team]";
 const ROLES: &str = "viewer, participant or writer";
 const HELP: &str = "\
 roles: viewer (watch) · participant (watch + suggest) · writer (type + suggest)
@@ -53,12 +54,18 @@ access:
   /invite <role> [ttl]       new invite link (ttl: 90s, 30m, 2h; max 24h)
   /grant <guest#> <role>     change a guest's role now
   /revoke <guest#>           disconnect the guest and burn their invite link
-suggestions (guests send them with `teamsent say <link> <text>`):
+prompt queue (guests type in their bar with Ctrl+], or `teamsent say <link> <text>`;
+the agent gets one prompt at a time, when it is free):
   /q                         show the queue
-  /y <#> [pane]              approve; delivered to the pane's agent when it is idle
-                             (default: the focused agent pane)
-  /e <#> <text>              rewrite a pending suggestion before approving
-  /n <#>                     reject
+  /p <text>                  queue your own prompt
+  /auto on|off               on: guests' prompts queue directly · off: you review each
+  /y <#> [pane]              accept a prompt under review (default: the agent pane)
+  /e <#> <text>              rewrite a waiting prompt
+  /n <#>                     remove a waiting prompt
+  /up <#>, /down <#>         move a prompt in the queue
+  /pause, /resume            hold or restart delivery
+  /clear                     remove every waiting prompt
+  /names on|off              prefix delivered prompts with the author's name
 floor:
   /drive <guest#>            give the floor (makes the guest a writer)
   /take                      take the floor back
@@ -101,22 +108,34 @@ struct Ctx {
     state: Shared,
     queue: SharedQueue,
     audit: Arc<Audit>,
-    dispatch: std::sync::mpsc::Sender<Job>,
     /// Agent pane and its status, refreshed every second.
     agent: Mutex<(String, String)>,
+    /// Auto mode: guests' prompts join the queue without review.
+    auto: AtomicBool,
+    /// Prefix delivered prompts with the author's name.
+    names: AtomicBool,
 }
 
 impl Ctx {
     fn new(state: Shared, audit: Audit) -> Self {
         let queue = SharedQueue::default();
         let audit = Arc::new(audit);
-        let dispatch = queue::spawn_dispatcher(Arc::clone(&queue), Arc::clone(&audit));
+        let resolve_state = Arc::clone(&state);
+        queue::spawn_dispatcher(
+            Arc::clone(&queue),
+            Arc::clone(&audit),
+            Arc::new(move || {
+                let team = resolve_state.lock().unwrap().team_pane.clone();
+                queue::agent_pane(team.as_deref()).map(|(pane, _)| pane)
+            }),
+        );
         Self {
             state,
             queue,
             audit,
-            dispatch,
             agent: Mutex::new((String::new(), "unknown".into())),
+            auto: AtomicBool::new(false),
+            names: AtomicBool::new(true),
         }
     }
 }
@@ -126,6 +145,7 @@ struct Options {
     role: Role,
     ttl: Duration,
     team: bool,
+    auto: bool,
 }
 
 pub(crate) fn run(args: &[String]) -> io::Result<()> {
@@ -147,11 +167,16 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         role: Role::Viewer,
         ttl: MAX_INVITE_TTL,
         team: true,
+        auto: false,
     };
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
         if flag == "--no-team" {
             options.team = false;
+            continue;
+        }
+        if flag == "--auto" {
+            options.auto = true;
             continue;
         }
         let value = iter.next().ok_or(format!("{flag} needs a value"))?;
@@ -182,6 +207,7 @@ async fn control_loop(options: Options) -> io::Result<()> {
         role,
         ttl,
         team,
+        auto,
     } = options;
     let room = random_id();
     let key = random_id();
@@ -199,6 +225,7 @@ async fn control_loop(options: Options) -> io::Result<()> {
     }
 
     let ctx = Arc::new(Ctx::new(Shared::default(), Audit::open_default()));
+    ctx.auto.store(auto, Ordering::Relaxed);
     ctx.audit
         .record("share_start", json!({ "relay": relay, "room": room }));
     let token = create_invite(&ctx, role, ttl);
@@ -339,6 +366,22 @@ fn run_command(line: &str, ctx: &Ctx, relay: &str, room: &str) -> Vec<String> {
             None => vec!["usage: /drive <guest#>".into()],
         },
         ["/take"] => vec![take_floor(ctx)],
+        ["/p", ..] => {
+            let text = line.split_once(char::is_whitespace).map_or("", |(_, t)| t);
+            vec![host_prompt(ctx, text).unwrap_or_else(|e| e)]
+        }
+        ["/auto", v @ ("on" | "off")] => vec![set_auto(ctx, *v == "on")],
+        ["/names", v @ ("on" | "off")] => vec![set_names(ctx, *v == "on")],
+        ["/pause"] => vec![set_paused(ctx, true)],
+        ["/resume"] => vec![set_paused(ctx, false)],
+        ["/clear"] => vec![clear_queue(ctx)],
+        ["/up", id] | ["/down", id] => match parse_guest_id(id) {
+            Some(id) => {
+                let delta = if args[0] == "/up" { -1 } else { 1 };
+                vec![move_prompt(ctx, id, delta).unwrap_or_else(|e| e)]
+            }
+            None => vec!["usage: /up <#> or /down <#>".into()],
+        },
         ["/log", rest @ ..] if rest.len() <= 1 => {
             let n = rest.first().and_then(|n| n.parse().ok()).unwrap_or(20);
             let lines = ctx.audit.tail(n);
@@ -564,7 +607,7 @@ async fn receive_suggestion(
         let msg = tokio::time::timeout(Duration::from_secs(10), ws.next()).await;
         match msg {
             Ok(Some(Ok(Message::Text(text)))) => match submit(ctx, id, &text) {
-                Ok(sid) => format!("teamsent-queued {sid}"),
+                Ok((_, msg)) => format!("teamsent-queued {msg}"),
                 Err(err) => format!("teamsent-denied {err}"),
             },
             _ => "teamsent-denied no suggestion received".to_string(),
@@ -750,8 +793,9 @@ fn access_for(state: &Shared, id: u32, is_input: bool) -> Option<(Role, Option<S
     Some((role, st.team_pane.clone(), may_type))
 }
 
-/// Queues a guest's suggestion and tells the host.
-fn submit(ctx: &Ctx, id: u32, text: &str) -> Result<u32, String> {
+/// Adds a guest's prompt to the queue (or to review) and tells the host.
+/// Returns the prompt id and a message for the guest.
+fn submit(ctx: &Ctx, id: u32, text: &str) -> Result<(u32, String), String> {
     let (name, role) = {
         let st = ctx.state.lock().unwrap();
         let guest = st.guests.get(&id).ok_or("unknown guest")?;
@@ -762,45 +806,104 @@ fn submit(ctx: &Ctx, id: u32, text: &str) -> Result<u32, String> {
     }
     let text = text.trim();
     if text.is_empty() || text.len() > MAX_SUGGESTION_BYTES {
-        return Err(format!("suggestion must be 1-{MAX_SUGGESTION_BYTES} bytes"));
+        return Err(format!("prompt must be 1-{MAX_SUGGESTION_BYTES} bytes"));
     }
+    let auto = ctx.auto.load(Ordering::Relaxed);
+    let attribution = ctx.names.load(Ordering::Relaxed).then_some(name.as_str());
     let author = format!("{name}#{id}");
-    let sid = ctx.queue.lock().unwrap().push(&author, text);
+    let (sid, place) = {
+        let mut q = ctx.queue.lock().unwrap();
+        let sid = q.push(&author, text, auto, attribution);
+        (sid, q.position(sid).unwrap_or(0))
+    };
     ctx.state.lock().unwrap().drafts.remove(&id);
-    eprintln!("\x07#{sid} from {author}: {}", queue::one_line(text, 200));
-    eprintln!("     /y {sid} to send to the agent, /e {sid} <text> to edit, /n {sid} to reject");
     ctx.audit.record(
         "suggestion",
-        json!({ "id": sid, "guest": id, "name": name, "text": text }),
+        json!({ "id": sid, "guest": id, "name": name, "text": text, "auto": auto }),
     );
-    queue::notify(
-        &format!("teamsent: {name} suggests #{sid}"),
-        &queue::one_line(text, 120),
-    );
-    Ok(sid)
+    if auto {
+        eprintln!(
+            "#{sid} queued ({place}) from {author}: {}",
+            queue::one_line(text, 200)
+        );
+        Ok((sid, format!("#{sid} queued, position {place}")))
+    } else {
+        eprintln!("\x07#{sid} from {author}: {}", queue::one_line(text, 200));
+        eprintln!("     /y {sid} accept · /e {sid} <text> edit · /n {sid} remove");
+        queue::notify(
+            &format!("teamsent: {name} suggests #{sid}"),
+            &queue::one_line(text, 120),
+        );
+        Ok((sid, format!("#{sid} sent to the host for review")))
+    }
+}
+
+/// The host's own prompt: queued directly, never attributed.
+fn host_prompt(ctx: &Ctx, text: &str) -> Result<String, String> {
+    let text = text.trim();
+    if text.is_empty() || text.len() > MAX_SUGGESTION_BYTES {
+        return Err(format!("usage: /p <text> (1-{MAX_SUGGESTION_BYTES} bytes)"));
+    }
+    let (sid, place) = {
+        let mut q = ctx.queue.lock().unwrap();
+        let sid = q.push("host", text, true, None);
+        (sid, q.position(sid).unwrap_or(0))
+    };
+    ctx.audit
+        .record("host_prompt", json!({ "id": sid, "text": text }));
+    Ok(format!("#{sid} queued, position {place}"))
 }
 
 fn approve(ctx: &Ctx, sid: u32, pane: Option<&str>) -> Result<String, String> {
-    let target = match pane {
-        Some(pane) => pane.to_string(),
-        None => {
-            let team = ctx.state.lock().unwrap().team_pane.clone();
-            queue::agent_pane(team.as_deref())
-                .map_err(|err| format!("cannot pick a pane: {err}"))?
-                .0
-        }
+    let place = {
+        let mut q = ctx.queue.lock().unwrap();
+        q.approve(sid, pane)?;
+        q.position(sid).unwrap_or(0)
     };
-    let text = ctx.queue.lock().unwrap().approve(sid, &target)?;
-    ctx.audit.record(
-        "suggestion_approved",
-        json!({ "id": sid, "target": target }),
-    );
-    let _ = ctx.dispatch.send(Job {
-        id: sid,
-        target: target.clone(),
-        text,
-    });
-    Ok(format!("#{sid} approved → {target}"))
+    ctx.audit
+        .record("suggestion_approved", json!({ "id": sid, "target": pane }));
+    Ok(format!("#{sid} accepted, position {place}"))
+}
+
+fn move_prompt(ctx: &Ctx, sid: u32, delta: i32) -> Result<String, String> {
+    let place = ctx.queue.lock().unwrap().move_by(sid, delta)?;
+    Ok(format!("#{sid} is now {place}"))
+}
+
+fn clear_queue(ctx: &Ctx) -> String {
+    let n = ctx.queue.lock().unwrap().clear();
+    ctx.audit.record("queue_cleared", json!({ "removed": n }));
+    format!("queue cleared ({n} removed)")
+}
+
+fn set_paused(ctx: &Ctx, paused: bool) -> String {
+    ctx.queue.lock().unwrap().paused = paused;
+    ctx.audit
+        .record("queue_paused", json!({ "paused": paused }));
+    if paused {
+        "delivery paused".into()
+    } else {
+        "delivery resumed".into()
+    }
+}
+
+fn set_auto(ctx: &Ctx, auto: bool) -> String {
+    ctx.auto.store(auto, Ordering::Relaxed);
+    ctx.audit.record("queue_mode", json!({ "auto": auto }));
+    if auto {
+        "auto: guests' prompts join the queue directly".into()
+    } else {
+        "review: you accept each guest prompt".into()
+    }
+}
+
+fn set_names(ctx: &Ctx, on: bool) -> String {
+    ctx.names.store(on, Ordering::Relaxed);
+    if on {
+        "prompts are prefixed with the author's name".into()
+    } else {
+        "prompts are sent without names".into()
+    }
 }
 
 fn reject(ctx: &Ctx, sid: u32) -> Result<String, String> {
@@ -904,6 +1007,9 @@ fn snapshot(ctx: &Ctx, me: Option<u32>) -> serde_json::Value {
         "queue": queue,
         "driver": driver.and_then(|id| st.guests.get(&id).map(|g| g.name.clone())),
         "team_pane": st.team_pane,
+        "mode": if ctx.auto.load(Ordering::Relaxed) { "auto" } else { "review" },
+        "paused": ctx.queue.lock().unwrap().paused,
+        "names": ctx.names.load(Ordering::Relaxed),
     })
 }
 
@@ -1006,7 +1112,11 @@ mod tests {
             admit(&ctx.state, &format!("t={participant}&name=p"), "c2", None),
             Ok((2, Role::Participant))
         );
-        let sid = ctx.queue.lock().unwrap().push("p#2", "write tests");
+        let sid = ctx
+            .queue
+            .lock()
+            .unwrap()
+            .push("p#2", "write tests", false, None);
         assert_eq!(
             run_command(&format!("/n {sid}"), &ctx, "ws://r", "room"),
             vec![format!("#{sid} rejected")]

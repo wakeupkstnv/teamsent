@@ -73,7 +73,7 @@ fn handle(ctx: &Ctx, id: u32, text: &str) -> Option<Value> {
             None
         }
         "submit" => Some(match submit(ctx, id, msg["text"].as_str().unwrap_or("")) {
-            Ok(sid) => json!({ "t": "result", "ok": true, "msg": format!("queued as #{sid}") }),
+            Ok((_, msg)) => json!({ "t": "result", "ok": true, "msg": msg }),
             Err(err) => json!({ "t": "result", "ok": false, "msg": err }),
         }),
         "vote" => {

@@ -68,8 +68,8 @@ async fn send(url: &str, text: &str) -> io::Result<String> {
         _ => return Err(io::Error::other("session not found (host offline?)")),
     };
     let _ = ws.close(None).await;
-    if let Some(id) = answer.strip_prefix("teamsent-queued ") {
-        return Ok(format!("queued as #{id}; the host will review it"));
+    if let Some(msg) = answer.strip_prefix("teamsent-queued ") {
+        return Ok(msg.to_string());
     }
     let reason = answer.strip_prefix("teamsent-denied ").unwrap_or(&answer);
     Err(io::Error::other(format!("not sent: {reason}")))

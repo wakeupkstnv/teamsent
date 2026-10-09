@@ -1,9 +1,12 @@
 //! `teamsent team`: the host's Team window.
 //!
-//! Runs in a herdr pane next to the agent (opened by `teamsent host`). Shows
-//! who is online, what each guest is typing right now, the suggestion queue,
-//! the agent's status and who holds the floor. The host acts on it with single
-//! keys; guests see the same pane but cannot type into it.
+//! Runs in a herdr pane next to the agent (opened by `teamsent host`). Works
+//! like a shared prompt queue: everyone proposes prompts, the agent takes them
+//! one at a time when it is free. The window shows what each guest is typing
+//! right now, the queue in delivery order, the mode (AUTO: guests' prompts
+//! queue directly; REVIEW: the host accepts each one), the agent's status and
+//! who holds the floor. The host can also queue its own prompts (`i`).
+//! Guests see the same pane but cannot type into it.
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::sync::mpsc;
@@ -17,7 +20,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::{execute, terminal};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
@@ -26,7 +29,7 @@ use serde_json::{json, Value};
 use super::host_control_socket_path;
 use super::queue::one_line;
 
-const HELP: &str = "tab people/queue · ↑↓ select · y send · e edit · n reject · d give floor · t take floor · right-click or m: person menu · x kick · q quit";
+const HELP: &str = "i prompt · y accept · n remove · e edit · K/J move · a auto/review · p pause · c clear · tab people · right-click/m person menu · x kick · q quit";
 
 /// What the person menu can do.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -55,13 +58,37 @@ struct Menu {
     selected: usize,
 }
 
-/// "Kick <name>?" dialog. Kick is not the default button.
+/// A yes/no dialog for destructive actions. "Cancel" is the default button.
 struct Confirm {
-    guest: u64,
-    name: String,
-    kick_selected: bool,
-    kick_button: Rect,
+    title: &'static str,
+    question: String,
+    detail: &'static str,
+    ok_label: &'static str,
+    cmd: Value,
+    ok_selected: bool,
+    ok_button: Rect,
     cancel_button: Rect,
+}
+
+impl Confirm {
+    fn new(
+        title: &'static str,
+        question: String,
+        detail: &'static str,
+        ok_label: &'static str,
+        cmd: Value,
+    ) -> Self {
+        Self {
+            title,
+            question,
+            detail,
+            ok_label,
+            cmd,
+            ok_selected: false,
+            ok_button: Rect::default(),
+            cancel_button: Rect::default(),
+        }
+    }
 }
 
 pub(crate) fn run(args: &[String]) -> io::Result<()> {
@@ -148,6 +175,15 @@ fn plain(state: &Value) -> Vec<String> {
         "floor: {}",
         state["driver"].as_str().unwrap_or("free")
     ));
+    out.push(format!(
+        "mode: {}{}",
+        state["mode"].as_str().unwrap_or("?"),
+        if state["paused"] == true {
+            " paused"
+        } else {
+            ""
+        }
+    ));
     for p in state["people"].as_array().into_iter().flatten() {
         let draft = p["draft"].as_str().unwrap_or("");
         out.push(format!(
@@ -170,10 +206,11 @@ fn plain(state: &Value) -> Vec<String> {
     }
     for q in state["queue"].as_array().into_iter().flatten() {
         out.push(format!(
-            "queue #{} {} [{}] votes={} {}",
+            "queue #{} {} [{}] pos={} votes={} {}",
             q["id"],
             q["author"].as_str().unwrap_or(""),
-            q["status"].as_str().unwrap_or(""),
+            q["state"].as_str().unwrap_or(""),
+            q["position"],
             q["votes"],
             q["text"].as_str().unwrap_or("")
         ));
@@ -192,8 +229,10 @@ struct App {
     focus: Focus,
     people: ListState,
     queue: ListState,
-    /// Inline edit of a suggestion: (id, text).
+    /// Inline edit of a prompt: (id, text).
     editing: Option<(u64, String)>,
+    /// The host's own prompt being typed.
+    composing: Option<String>,
     status: String,
     /// Where the people list was drawn, for mouse hit-testing.
     people_area: Rect,
@@ -202,6 +241,21 @@ struct App {
 }
 
 impl App {
+    fn new() -> Self {
+        Self {
+            state: json!({}),
+            focus: Focus::Queue,
+            people: ListState::default(),
+            queue: ListState::default(),
+            editing: None,
+            composing: None,
+            status: "connecting to teamsent host…".into(),
+            people_area: Rect::default(),
+            menu: None,
+            confirm: None,
+        }
+    }
+
     fn queue_items(&self) -> Vec<&Value> {
         self.state["queue"]
             .as_array()
@@ -219,7 +273,7 @@ impl App {
             .collect()
     }
 
-    fn selected_suggestion(&self) -> Option<&Value> {
+    fn selected_prompt(&self) -> Option<&Value> {
         self.queue
             .selected()
             .and_then(|i| self.queue_items().get(i).copied())
@@ -263,15 +317,34 @@ impl App {
         });
     }
 
-    fn open_confirm(&mut self, guest: u64, name: String) {
+    fn open_kick(&mut self, guest: u64, name: String) {
         self.menu = None;
-        self.confirm = Some(Confirm {
-            guest,
-            name,
-            kick_selected: false,
-            kick_button: Rect::default(),
-            cancel_button: Rect::default(),
-        });
+        self.confirm = Some(Confirm::new(
+            " kick ",
+            format!("Kick {name}?"),
+            "They are disconnected and their invite link stops working.",
+            " Kick ",
+            json!({ "cmd": "kick", "guest": guest }),
+        ));
+    }
+
+    fn open_clear(&mut self) {
+        let waiting = self
+            .queue_items()
+            .iter()
+            .filter(|q| q["waiting"] == true)
+            .count();
+        if waiting == 0 {
+            self.status = "queue is already empty".into();
+            return;
+        }
+        self.confirm = Some(Confirm::new(
+            " clear queue ",
+            format!("Remove all {waiting} waiting prompts?"),
+            "The prompt that is already with the agent is not affected.",
+            " Clear ",
+            json!({ "cmd": "clear" }),
+        ));
     }
 
     /// Runs a menu action; returns the command to send, if any.
@@ -279,7 +352,7 @@ impl App {
         let menu = self.menu.take()?;
         match act {
             Act::Kick => {
-                self.open_confirm(menu.guest, menu.name);
+                self.open_kick(menu.guest, menu.name);
                 None
             }
             Act::Drive => Some(json!({ "cmd": "drive", "guest": menu.guest })),
@@ -308,19 +381,18 @@ fn tui() -> io::Result<()> {
     result
 }
 
+type Conn = Option<(mpsc::Receiver<Value>, Writer)>;
+
+fn send(conn: &mut Conn, cmd: Value) {
+    if let Some((_, w)) = conn {
+        let _ = writeln!(w, "{cmd}");
+    }
+}
+
 fn tui_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
-    let mut app = App {
-        state: json!({}),
-        focus: Focus::Queue,
-        people: ListState::default(),
-        queue: ListState::default(),
-        editing: None,
-        status: "connecting to teamsent host…".into(),
-        people_area: Rect::default(),
-        menu: None,
-        confirm: None,
-    };
-    let mut conn: Option<(mpsc::Receiver<Value>, Writer)> = None;
+    let mut app = App::new();
+    let mut conn: Conn = None;
+    let mut dirty = true;
 
     loop {
         if conn.is_none() {
@@ -331,6 +403,7 @@ fn tui_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()>
                 }
                 Err(err) => app.status = err.to_string(),
             }
+            dirty = true;
         }
         if let Some((rx, _)) = &conn {
             loop {
@@ -344,22 +417,23 @@ fn tui_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()>
                         break;
                     }
                 }
+                dirty = true;
             }
         }
         let (queue_len, people_len) = (app.queue_items().len(), app.guests().len());
         clamp(&mut app.queue, queue_len);
         clamp(&mut app.people, people_len);
 
-        term.draw(|f| draw(f, &mut app))?;
+        // Redraw only when something changed: keeps the pane cheap to share.
+        if dirty {
+            term.draw(|f| draw(f, &mut app))?;
+            dirty = false;
+        }
 
-        if !event::poll(Duration::from_millis(150))? {
+        if !event::poll(Duration::from_millis(100))? {
             continue;
         }
-        let send = |conn: &mut Option<(mpsc::Receiver<Value>, Writer)>, cmd: Value| {
-            if let Some((_, w)) = conn {
-                let _ = writeln!(w, "{cmd}");
-            }
-        };
+        dirty = true;
         let key = match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => key,
             Event::Mouse(mouse) => {
@@ -370,122 +444,167 @@ fn tui_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()>
             }
             _ => continue,
         };
-
-        if let Some(confirm) = &mut app.confirm {
-            match key.code {
-                KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                    confirm.kick_selected = !confirm.kick_selected
-                }
-                KeyCode::Char('y') => {
-                    let guest = confirm.guest;
-                    app.confirm = None;
-                    send(&mut conn, json!({ "cmd": "kick", "guest": guest }));
-                }
-                KeyCode::Enter => {
-                    let (guest, kick) = (confirm.guest, confirm.kick_selected);
-                    app.confirm = None;
-                    if kick {
-                        send(&mut conn, json!({ "cmd": "kick", "guest": guest }));
-                    }
-                }
-                KeyCode::Char('n') | KeyCode::Esc => app.confirm = None,
-                _ => {}
-            }
-            continue;
-        }
-
-        if let Some(menu) = &mut app.menu {
-            match key.code {
-                KeyCode::Up | KeyCode::Char('k') => menu.selected = menu.selected.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    menu.selected = (menu.selected + 1).min(MENU.len() - 1)
-                }
-                KeyCode::Enter => {
-                    let act = MENU[menu.selected].1;
-                    if let Some(cmd) = app.act(act) {
-                        send(&mut conn, cmd);
-                    }
-                }
-                KeyCode::Esc | KeyCode::Char('q') => app.menu = None,
-                _ => {}
-            }
-            continue;
-        }
-
-        if let Some((id, text)) = &mut app.editing {
-            match key.code {
-                KeyCode::Enter => {
-                    let cmd = json!({ "cmd": "edit", "id": *id, "text": text.clone() });
-                    send(&mut conn, cmd);
-                    app.editing = None;
-                }
-                KeyCode::Esc => app.editing = None,
-                KeyCode::Backspace => {
-                    text.pop();
-                }
-                KeyCode::Char(c) => text.push(c),
-                _ => {}
-            }
-            continue;
-        }
-
-        match key.code {
-            KeyCode::Char('q') => return Ok(()),
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
-            KeyCode::Tab => {
-                app.focus = if app.focus == Focus::Queue {
-                    Focus::People
-                } else {
-                    Focus::Queue
-                }
-            }
-            KeyCode::Up | KeyCode::Char('k') => step(&mut app, -1),
-            KeyCode::Down | KeyCode::Char('j') => step(&mut app, 1),
-            KeyCode::Char('y') => {
-                if let Some(q) = app.selected_suggestion() {
-                    send(&mut conn, json!({ "cmd": "approve", "id": q["id"] }));
-                }
-            }
-            KeyCode::Char('n') => {
-                if let Some(q) = app.selected_suggestion() {
-                    send(&mut conn, json!({ "cmd": "reject", "id": q["id"] }));
-                }
-            }
-            KeyCode::Char('e') => {
-                if let Some(q) = app.selected_suggestion() {
-                    if q["pending"] == true {
-                        app.editing = Some((
-                            q["id"].as_u64().unwrap_or_default(),
-                            q["text"].as_str().unwrap_or_default().to_string(),
-                        ));
-                    }
-                }
-            }
-            KeyCode::Char('d') => {
-                if let Some(p) = app.selected_guest() {
-                    send(&mut conn, json!({ "cmd": "drive", "guest": p["id"] }));
-                }
-            }
-            KeyCode::Char('t') => send(&mut conn, json!({ "cmd": "take" })),
-            KeyCode::Char('m') => {
-                if let Some(i) = app.people.selected() {
-                    let a = app.people_area;
-                    let row = a.y + 1 + i.saturating_sub(app.people.offset()) as u16;
-                    app.open_menu(i, a.x + 2, row);
-                }
-            }
-            KeyCode::Char('x') => {
-                if let Some(p) = app.selected_guest() {
-                    let (id, name) = (
-                        p["id"].as_u64().unwrap_or_default(),
-                        p["name"].as_str().unwrap_or_default().to_string(),
-                    );
-                    app.open_confirm(id, name);
-                }
-            }
-            _ => {}
+        if handle_key(&mut app, &mut conn, key.code, key.modifiers) {
+            return Ok(());
         }
     }
+}
+
+/// Applies one key press. Returns true to quit.
+fn handle_key(app: &mut App, conn: &mut Conn, code: KeyCode, mods: KeyModifiers) -> bool {
+    if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
+        return true;
+    }
+
+    if let Some(confirm) = &mut app.confirm {
+        match code {
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                confirm.ok_selected = !confirm.ok_selected
+            }
+            KeyCode::Char('y') => {
+                let cmd = confirm.cmd.clone();
+                app.confirm = None;
+                send(conn, cmd);
+            }
+            KeyCode::Enter => {
+                let (cmd, ok) = (confirm.cmd.clone(), confirm.ok_selected);
+                app.confirm = None;
+                if ok {
+                    send(conn, cmd);
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Esc => app.confirm = None,
+            _ => {}
+        }
+        return false;
+    }
+
+    if let Some(menu) = &mut app.menu {
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => menu.selected = menu.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                menu.selected = (menu.selected + 1).min(MENU.len() - 1)
+            }
+            KeyCode::Enter => {
+                let act = MENU[menu.selected].1;
+                if let Some(cmd) = app.act(act) {
+                    send(conn, cmd);
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') => app.menu = None,
+            _ => {}
+        }
+        return false;
+    }
+
+    // Text input: editing a prompt or composing the host's own.
+    let input = if app.editing.is_some() {
+        app.editing.as_mut().map(|(_, t)| t)
+    } else {
+        app.composing.as_mut()
+    };
+    if let Some(text) = input {
+        match code {
+            KeyCode::Enter => {
+                let text = text.clone();
+                if let Some((id, _)) = app.editing.take() {
+                    send(conn, json!({ "cmd": "edit", "id": id, "text": text }));
+                } else if app.composing.take().is_some() && !text.trim().is_empty() {
+                    send(conn, json!({ "cmd": "prompt", "text": text }));
+                }
+            }
+            KeyCode::Esc => {
+                app.editing = None;
+                app.composing = None;
+            }
+            KeyCode::Backspace => {
+                text.pop();
+            }
+            KeyCode::Char(c) => text.push(c),
+            _ => {}
+        }
+        return false;
+    }
+
+    let id = app.selected_prompt().map(|q| q["id"].clone());
+    match code {
+        KeyCode::Char('q') => return true,
+        KeyCode::Tab => {
+            app.focus = if app.focus == Focus::Queue {
+                Focus::People
+            } else {
+                Focus::Queue
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => step(app, -1),
+        KeyCode::Down | KeyCode::Char('j') => step(app, 1),
+        KeyCode::Char('i') => app.composing = Some(String::new()),
+        KeyCode::Char('y') => {
+            if let Some(id) = id {
+                send(conn, json!({ "cmd": "approve", "id": id }));
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Delete => {
+            if let Some(id) = id {
+                send(conn, json!({ "cmd": "reject", "id": id }));
+            }
+        }
+        KeyCode::Char('e') => {
+            if let Some(q) = app.selected_prompt() {
+                if q["waiting"] == true {
+                    app.editing = Some((
+                        q["id"].as_u64().unwrap_or_default(),
+                        q["text"].as_str().unwrap_or_default().to_string(),
+                    ));
+                }
+            }
+        }
+        KeyCode::Char('K') => {
+            if let Some(id) = id {
+                send(conn, json!({ "cmd": "move", "id": id, "delta": -1 }));
+                step(app, -1);
+            }
+        }
+        KeyCode::Char('J') => {
+            if let Some(id) = id {
+                send(conn, json!({ "cmd": "move", "id": id, "delta": 1 }));
+                step(app, 1);
+            }
+        }
+        KeyCode::Char('a') => {
+            let on = app.state["mode"] != "auto";
+            send(conn, json!({ "cmd": "auto", "on": on }));
+        }
+        KeyCode::Char('p') => {
+            let paused = app.state["paused"] != true;
+            send(conn, json!({ "cmd": "pause", "paused": paused }));
+        }
+        KeyCode::Char('c') => app.open_clear(),
+        KeyCode::Char('d') => {
+            if let Some(p) = app.selected_guest() {
+                send(conn, json!({ "cmd": "drive", "guest": p["id"] }));
+            }
+        }
+        KeyCode::Char('t') => send(conn, json!({ "cmd": "take" })),
+        KeyCode::Char('m') => {
+            if let Some(i) = app.people.selected() {
+                let a = app.people_area;
+                let row = a.y + 1 + i.saturating_sub(app.people.offset()) as u16;
+                app.open_menu(i, a.x + 2, row);
+            }
+        }
+        KeyCode::Char('x') => {
+            if let Some(p) = app.selected_guest() {
+                let (id, name) = (
+                    p["id"].as_u64().unwrap_or_default(),
+                    p["name"].as_str().unwrap_or_default().to_string(),
+                );
+                app.open_kick(id, name);
+            }
+        }
+        _ => {}
+    }
+    false
 }
 
 /// Mouse: right-click a person for the menu, click menu items and dialog buttons.
@@ -495,13 +614,13 @@ fn on_mouse(app: &mut App, mouse: MouseEvent) -> Option<Value> {
         return None;
     };
     if let Some(confirm) = &app.confirm {
-        let guest = confirm.guest;
-        let kick = contains(confirm.kick_button, column, row);
+        let cmd = confirm.cmd.clone();
+        let ok = contains(confirm.ok_button, column, row);
         let cancel = contains(confirm.cancel_button, column, row);
-        if kick || cancel || button == MouseButton::Left {
+        if ok || cancel || button == MouseButton::Left {
             app.confirm = None;
         }
-        return kick.then(|| json!({ "cmd": "kick", "guest": guest }));
+        return ok.then_some(cmd);
     }
     if let Some(menu) = &app.menu {
         if contains(menu.at, column, row) {
@@ -552,35 +671,85 @@ fn step(app: &mut App, delta: i32) {
     list.select(Some(i.clamp(0, len as i32 - 1) as usize));
 }
 
+/// Badge text and color for a prompt's state.
+fn badge(state: &str) -> (&'static str, Color) {
+    match state {
+        "pending" => ("REVIEW", Color::Yellow),
+        "queued" => ("QUEUED", Color::Cyan),
+        "sending" => ("→ AGENT", Color::Green),
+        "sent" => ("SENT", Color::DarkGray),
+        "failed" => ("FAILED", Color::Red),
+        _ => ("REMOVED", Color::DarkGray),
+    }
+}
+
 fn draw(f: &mut ratatui::Frame, app: &mut App) {
     let s = &app.state;
     let guests = app.guests().len();
-    let [header, people_area, queue_area, editor, footer] = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Length(guests.clamp(1, 8) as u16 + 2),
+    let typing: Vec<(String, String)> = app
+        .guests()
+        .iter()
+        .filter_map(|p| {
+            let draft = p["draft"].as_str().unwrap_or("");
+            (!draft.is_empty()).then(|| {
+                (
+                    p["name"].as_str().unwrap_or("").to_string(),
+                    draft.to_string(),
+                )
+            })
+        })
+        .collect();
+    let input_open = app.editing.is_some() || app.composing.is_some();
+    let [header, people_area, typing_area, queue_area, input_area, footer] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(guests.clamp(1, 6) as u16 + 2),
+        Constraint::Length(if typing.is_empty() {
+            0
+        } else {
+            typing.len().min(4) as u16 + 2
+        }),
         Constraint::Min(4),
-        Constraint::Length(if app.editing.is_some() { 3 } else { 0 }),
+        Constraint::Length(if input_open { 3 } else { 0 }),
         Constraint::Length(3),
     ])
     .areas(f.area());
 
+    // Header: mode, delivery, agent, floor.
+    let auto = s["mode"] == "auto";
+    let mode = if auto {
+        Span::styled(" AUTO ", Style::new().black().on_green().bold())
+    } else {
+        Span::styled(" REVIEW ", Style::new().black().on_yellow().bold())
+    };
+    let mode_hint = if auto {
+        " guests' prompts queue directly"
+    } else {
+        " you accept each guest prompt"
+    };
+    let delivery = if s["paused"] == true {
+        Span::styled(" ⏸ PAUSED ", Style::new().black().on_red().bold())
+    } else {
+        Span::raw("")
+    };
     let agent = format!(
         "agent {} · {}",
         s["agent"]["pane"].as_str().unwrap_or("?"),
         s["agent"]["status"].as_str().unwrap_or("?")
     );
     let floor = match s["driver"].as_str() {
-        Some(name) => format!("🚗 {name} is driving"),
-        None => "floor free".into(),
+        Some(name) => format!(" · 🚗 {name} driving"),
+        None => String::new(),
     };
     f.render_widget(
         Paragraph::new(vec![
-            Line::from(vec!["teamsent · Team".bold()]),
-            Line::from(format!("{agent} · {floor}")).dim(),
+            Line::from(vec!["teamsent · Team ".bold(), mode, delivery]),
+            Line::from(mode_hint).dim(),
+            Line::from(format!("{agent}{floor}")).dim(),
         ]),
         header,
     );
 
+    // People.
     let people: Vec<ListItem> = app
         .guests()
         .iter()
@@ -592,17 +761,10 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
                     p["name"].as_str().unwrap_or("").to_string(),
                     Style::new().bold(),
                 ),
-                Span::raw(format!("  {}", p["role"].as_str().unwrap_or(""))),
+                Span::raw(format!("  {}", p["role"].as_str().unwrap_or(""))).dim(),
             ];
             if p["driving"] == true {
                 spans.push(Span::raw("  🚗"));
-            }
-            let draft = p["draft"].as_str().unwrap_or("");
-            if !draft.is_empty() {
-                spans.push(Span::styled(
-                    format!("  ✎ {}", one_line(draft, 60)),
-                    Style::new().italic().dim(),
-                ));
             }
             ListItem::new(Line::from(spans))
         })
@@ -622,43 +784,84 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     f.render_stateful_widget(people, people_area, &mut app.people);
     app.people_area = people_area;
 
+    // What people are typing right now.
+    if !typing.is_empty() {
+        let lines: Vec<Line> = typing
+            .iter()
+            .take(4)
+            .map(|(name, draft)| {
+                Line::from(vec![
+                    Span::styled(format!("{name} › "), Style::new().bold()),
+                    Span::styled(one_line(draft, 200), Style::new().italic()),
+                    Span::raw("▏").dim(),
+                ])
+            })
+            .collect();
+        f.render_widget(
+            Paragraph::new(lines).block(Block::bordered().title(" typing ")),
+            typing_area,
+        );
+    }
+
+    // Queue in delivery order.
     let queue: Vec<ListItem> = app
         .queue_items()
         .iter()
         .map(|q| {
+            let state = q["state"].as_str().unwrap_or("");
+            let (label, color) = badge(state);
+            let place = q["position"]
+                .as_u64()
+                .map(|p| format!("{p}. "))
+                .unwrap_or_else(|| "   ".into());
             let votes = q["votes"].as_u64().unwrap_or(0);
-            let head = format!(
-                "#{} {}{} [{}]",
-                q["id"],
-                q["author"].as_str().unwrap_or(""),
-                if votes > 0 {
-                    format!(" +{votes}")
-                } else {
-                    String::new()
-                },
-                q["status"].as_str().unwrap_or("")
-            );
-            let style = if q["pending"] == true {
+            let open = q["waiting"] == true || state == "sending";
+            let text_style = if open {
                 Style::new()
             } else {
                 Style::new().dim()
             };
             ListItem::new(vec![
-                Line::styled(head, style.bold()),
+                Line::from(vec![
+                    Span::raw(place),
+                    Span::styled(format!(" {label} "), Style::new().fg(color).bold()),
+                    Span::styled(
+                        format!(" {}", q["author"].as_str().unwrap_or("")),
+                        Style::new().bold(),
+                    ),
+                    Span::raw(if votes > 0 {
+                        format!("  +{votes}")
+                    } else {
+                        String::new()
+                    }),
+                    Span::raw(format!("  #{}", q["id"])).dim(),
+                ]),
                 Line::styled(
-                    format!("  {}", one_line(q["text"].as_str().unwrap_or(""), 200)),
-                    style,
+                    format!("   {}", one_line(q["text"].as_str().unwrap_or(""), 200)),
+                    text_style,
                 ),
             ])
         })
         .collect();
-    let queue_block = Block::bordered().title(if app.focus == Focus::Queue {
-        " suggestions ◂ "
-    } else {
-        " suggestions "
-    });
+    let waiting = app
+        .queue_items()
+        .iter()
+        .filter(|q| q["waiting"] == true)
+        .count();
+    let queue_title = format!(
+        " queue · {waiting} waiting {}",
+        if app.focus == Focus::Queue {
+            "◂ "
+        } else {
+            ""
+        }
+    );
+    let queue_block = Block::bordered().title(queue_title);
     let queue = if queue.is_empty() {
-        List::new(vec![ListItem::new("  no suggestions yet")]).block(queue_block)
+        List::new(vec![ListItem::new(
+            "  empty — guests press Ctrl+] in their bar, you press i",
+        )])
+        .block(queue_block)
     } else {
         List::new(queue)
             .block(queue_block)
@@ -666,12 +869,18 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     };
     f.render_stateful_widget(queue, queue_area, &mut app.queue);
 
-    if let Some((id, text)) = &app.editing {
+    // Prompt / edit input.
+    let input = match (&app.editing, &app.composing) {
+        (Some((id, text)), _) => Some((format!(" edit #{id} · Enter save · Esc cancel "), text)),
+        (None, Some(text)) => Some((" your prompt · Enter queue · Esc cancel ".to_string(), text)),
+        _ => None,
+    };
+    if let Some((title, text)) = input {
         f.render_widget(
             Paragraph::new(format!("{text}▏"))
                 .wrap(Wrap { trim: false })
-                .block(Block::bordered().title(format!(" edit #{id} · Enter save · Esc cancel "))),
-            editor,
+                .block(Block::bordered().title(title)),
+            input_area,
         );
     }
 
@@ -724,13 +933,13 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
             screen,
         );
         f.render_widget(Clear, area);
-        let block = Block::bordered().title(" kick ").red();
+        let block = Block::bordered().title(confirm.title).red();
         let inner = block.inner(area);
         f.render_widget(block, area);
         f.render_widget(
             Paragraph::new(vec![
-                Line::from(format!("Kick {}?", confirm.name)).bold(),
-                Line::from("They are disconnected and their invite link stops working.").dim(),
+                Line::from(confirm.question.clone()).bold(),
+                Line::from(confirm.detail).dim(),
             ])
             .wrap(Wrap { trim: true }),
             Rect::new(
@@ -741,11 +950,14 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
             ),
         );
         let row = inner.y + inner.height.saturating_sub(1);
-        let kick = " Kick ";
         let cancel = " Cancel ";
-        confirm.kick_button = Rect::new(inner.x + 1, row, kick.len() as u16, 1);
-        confirm.cancel_button =
-            Rect::new(inner.x + 3 + kick.len() as u16, row, cancel.len() as u16, 1);
+        confirm.ok_button = Rect::new(inner.x + 1, row, confirm.ok_label.len() as u16, 1);
+        confirm.cancel_button = Rect::new(
+            inner.x + 3 + confirm.ok_label.len() as u16,
+            row,
+            cancel.len() as u16,
+            1,
+        );
         let button = |label: &str, selected: bool, danger: bool| {
             let style = if danger {
                 Style::new().red()
@@ -759,11 +971,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
             })
         };
         f.render_widget(
-            button(kick, confirm.kick_selected, true),
-            confirm.kick_button,
+            button(confirm.ok_label, confirm.ok_selected, true),
+            confirm.ok_button,
         );
         f.render_widget(
-            button(cancel, !confirm.kick_selected, false),
+            button(cancel, !confirm.ok_selected, false),
             confirm.cancel_button,
         );
     }
@@ -783,21 +995,14 @@ mod tests {
     use super::*;
 
     fn app_with_guests() -> App {
-        App {
-            state: json!({ "people": [
-                { "id": 0, "name": "host" },
-                { "id": 2, "name": "kolya", "role": "participant" },
-                { "id": 3, "name": "asel", "role": "writer" },
-            ] }),
-            focus: Focus::Queue,
-            people: ListState::default(),
-            queue: ListState::default(),
-            editing: None,
-            status: String::new(),
-            people_area: Rect::new(0, 3, 40, 4),
-            menu: None,
-            confirm: None,
-        }
+        let mut app = App::new();
+        app.state = json!({ "people": [
+            { "id": 0, "name": "host" },
+            { "id": 2, "name": "kolya", "role": "participant" },
+            { "id": 3, "name": "asel", "role": "writer" },
+        ] });
+        app.people_area = Rect::new(0, 3, 40, 4);
+        app
     }
 
     fn click(button: MouseButton, column: u16, row: u16) -> MouseEvent {
@@ -820,8 +1025,8 @@ mod tests {
         let (x, y) = (menu.at.x + 1, menu.at.y + 1);
         assert_eq!(on_mouse(&mut app, click(MouseButton::Left, x, y)), None);
         let confirm = app.confirm.as_mut().expect("confirm dialog");
-        assert!(!confirm.kick_selected, "Cancel is the default");
-        confirm.kick_button = Rect::new(10, 10, 6, 1);
+        assert!(!confirm.ok_selected, "Cancel is the default");
+        confirm.ok_button = Rect::new(10, 10, 6, 1);
         assert_eq!(
             on_mouse(&mut app, click(MouseButton::Left, 11, 10)),
             Some(json!({ "cmd": "kick", "guest": 3 }))
@@ -832,7 +1037,7 @@ mod tests {
     #[test]
     fn clicking_outside_closes_dialog_without_kicking() {
         let mut app = app_with_guests();
-        app.open_confirm(2, "kolya".into());
+        app.open_kick(2, "kolya".into());
         assert_eq!(on_mouse(&mut app, click(MouseButton::Left, 0, 0)), None);
         assert!(app.confirm.is_none());
     }
@@ -851,24 +1056,58 @@ mod tests {
     }
 
     #[test]
-    fn plain_view_lists_drafts_queue_and_floor() {
+    fn clear_asks_first_and_enter_defaults_to_cancel() {
+        let mut app = app_with_guests();
+        app.state["queue"] = json!([{ "id": 1, "waiting": true }]);
+        let mut conn: Conn = None;
+        handle_key(&mut app, &mut conn, KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(app.confirm.is_some());
+        handle_key(&mut app, &mut conn, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.confirm.is_none(), "Enter on the default button cancels");
+    }
+
+    #[test]
+    fn host_composer_collects_text() {
+        let mut app = app_with_guests();
+        let mut conn: Conn = None;
+        handle_key(&mut app, &mut conn, KeyCode::Char('i'), KeyModifiers::NONE);
+        for c in "run tests".chars() {
+            handle_key(&mut app, &mut conn, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(app.composing.as_deref(), Some("run tests"));
+        // 'q' while typing is text, not quit.
+        assert!(!handle_key(
+            &mut app,
+            &mut conn,
+            KeyCode::Char('q'),
+            KeyModifiers::NONE
+        ));
+        handle_key(&mut app, &mut conn, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.composing.is_none());
+    }
+
+    #[test]
+    fn plain_view_lists_drafts_queue_mode_and_floor() {
         let state = json!({
             "agent": { "pane": "w1:p1", "status": "working" },
             "driver": "asel",
+            "mode": "auto",
+            "paused": true,
             "people": [
                 { "id": 0, "name": "host", "role": "host", "online": true, "draft": "", "driving": false },
                 { "id": 2, "name": "kolya", "role": "participant", "online": true, "draft": "add te", "driving": false },
             ],
-            "queue": [ { "id": 3, "author": "kolya#2", "status": "pending", "votes": 1, "text": "add tests" } ],
+            "queue": [ { "id": 3, "author": "kolya#2", "state": "queued", "position": 1, "votes": 1, "text": "add tests" } ],
         });
         let lines = plain(&state);
         assert_eq!(lines[0], "agent w1:p1: working");
         assert_eq!(lines[1], "floor: asel");
+        assert_eq!(lines[2], "mode: auto paused");
         assert!(lines
             .iter()
             .any(|l| l.contains("kolya") && l.contains("typing: add te")));
         assert!(lines
             .iter()
-            .any(|l| l.starts_with("queue #3") && l.contains("add tests")));
+            .any(|l| l.starts_with("queue #3") && l.contains("[queued] pos=1")));
     }
 }

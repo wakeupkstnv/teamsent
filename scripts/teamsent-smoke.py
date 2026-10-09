@@ -206,18 +206,18 @@ try:
     m_part = host_cmd("/invite participant 10m", r"teamsent join (\S+)")
     assert m_part, "no participant link"
     code, out = run("say", m_part.group(1), "--name", "part1", "echo SUGGESTED_$((6+6))", timeout=15)
-    sid = re.search(r"queued as #(\d+)", out)
+    sid = re.search(r"#(\d+) (?:sent to the host|queued)", out)
     checks["participant suggestion queued"] = code == 0 and bool(sid)
     checks["host sees suggestion"] = bool(wait_log(host_log, r"#\d+ from part1#\d+: echo SUGGESTED", 5))
     time.sleep(1)
     checks["not sent before approval"] = "SUGGESTED_12" not in pane_text(pane)
     if sid:
-        host_cmd(f"/y {sid.group(1)} {pane}", r"approved")
+        host_cmd(f"/y {sid.group(1)} {pane}", r"accepted")
         checks["approved suggestion delivered"] = bool(wait_log(host_log, rf"#{sid.group(1)} delivered", 15))
         time.sleep(1)
         checks["suggestion ran in pane"] = "SUGGESTED_12" in pane_text(pane)
     code, out = run("say", m_part.group(1), "--name", "part1", "echo REJECTED_$((1+2))", timeout=15)
-    sid2 = re.search(r"queued as #(\d+)", out)
+    sid2 = re.search(r"#(\d+) (?:sent to the host|queued)", out)
     if sid2:
         checks["/n rejects"] = bool(host_cmd(f"/n {sid2.group(1)}", r"rejected"))
         time.sleep(1)
@@ -242,10 +242,35 @@ try:
         code, out = team_send({"cmd": "edit", "id": int(qid.group(1)), "text": "echo EDITED_$((7+7))"})
         checks["team edit"] = code == 0
         code, out = team_send({"cmd": "approve", "id": int(qid.group(1)), "pane": pane})
-        checks["team approve"] = code == 0 and "approved" in out
+        checks["team approve"] = code == 0 and "accepted" in out
         checks["team-approved delivered"] = bool(wait_log(host_log, rf"#{qid.group(1)} delivered", 15))
         time.sleep(1)
         checks["edited text ran"] = "EDITED_14" in pane_text(pane)
+
+    # Auto mode (coshell-style): prompts queue without review; pause holds delivery.
+    checks["/auto on"] = bool(host_cmd("/auto on", r"auto: guests"))
+    checks["/pause"] = bool(host_cmd("/pause", r"delivery paused"))
+    code, out = run("say", m_part.group(1), "--name", "part1", "echo AUTO_$((9+9))", timeout=15)
+    checks["auto prompt queued"] = code == 0 and "queued, position 1" in out
+    host_cmd("/p echo HOSTP_$((3+3))", r"queued, position 2")
+    time.sleep(2)
+    checks["paused: nothing delivered"] = "AUTO_18" not in pane_text(pane)
+    state = team_state()
+    checks["team shows auto+paused"] = "mode: auto paused" in state
+    host_cmd("/resume", r"delivery resumed")
+    checks["auto prompt delivered after resume"] = bool(wait_log(host_log, r"AUTO_18|#\d+ delivered", 15))
+    time.sleep(3)
+    text = pane_text(pane)
+    checks["auto prompt ran with author"] = "part1: echo AUTO" in text or "AUTO_18" in text
+    checks["host prompt ran"] = "HOSTP_6" in text
+    host_cmd("/pause", r"delivery paused")
+    run("say", m_part.group(1), "--name", "part1", "echo CLEARED_1", timeout=15)
+    run("say", m_part.group(1), "--name", "part1", "echo CLEARED_2", timeout=15)
+    checks["/clear"] = bool(host_cmd("/clear", r"queue cleared \(2 removed\)"))
+    host_cmd("/resume", r"delivery resumed")
+    host_cmd("/auto off", r"review:")
+    time.sleep(2)
+    checks["cleared never sent"] = "CLEARED_" not in pane_text(pane).replace("echo CLEARED", "")
 
     # Team window: role change and kick (what the right-click menu sends).
     gid = re.search(r"person #(\d+) barguest", team_state())
