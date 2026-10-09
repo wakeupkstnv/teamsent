@@ -288,6 +288,13 @@ try:
     checks["revoked guest disconnected"] = writer.exited(8)
     code, out = run("join", m.group(1), timeout=10)
     checks["revoked link refused"] = code != 0 and "invite revoked" in out
+
+    # Stopping the host closes its Team window.
+    panes_before = run("pane", "list")[1].count('"pane_id"')
+    host.send_signal(signal.SIGINT)
+    wait_log(host_log, r"Stopped sharing", 10)
+    time.sleep(1)
+    checks["team window closed on stop"] = run("pane", "list")[1].count('"pane_id"') == panes_before - 1
 finally:
     for g in guests:
         g.kill()

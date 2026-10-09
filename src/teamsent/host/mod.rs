@@ -268,9 +268,13 @@ async fn control_loop(options: Options) -> io::Result<()> {
                     }
                 }
                 Some(Ok(Message::Close(_))) | None => {
+                    close_team_pane();
                     return Err(io::Error::other("relay closed the room"));
                 }
-                Some(Err(err)) => return Err(io::Error::other(err)),
+                Some(Err(err)) => {
+                    close_team_pane();
+                    return Err(io::Error::other(err));
+                }
                 Some(Ok(_)) => {}
             },
             line = stdin.next_line(), if stdin_open => match line {
@@ -284,6 +288,7 @@ async fn control_loop(options: Options) -> io::Result<()> {
             },
             _ = tokio::signal::ctrl_c() => {
                 let _ = ws.close(None).await;
+                close_team_pane();
                 ctx.audit.record("share_stop", json!({}));
                 eprintln!("Stopped sharing.");
                 return Ok(());
@@ -1038,8 +1043,38 @@ fn spawn_watcher(ctx: Arc<Ctx>) {
     });
 }
 
+/// Where the Team window's terminal id is remembered between runs, so a window
+/// left by a crashed or killed host is closed instead of piling up.
+fn team_marker_path() -> std::path::PathBuf {
+    crate::config::state_dir().join("team-terminal")
+}
+
+/// Closes the Team window recorded in the marker, if that terminal still exists.
+/// Matching by terminal id (unique) rather than pane id (reused) means a pane
+/// that took over the old id is never closed.
+fn close_team_pane() {
+    let marker = team_marker_path();
+    let Ok(terminal) = std::fs::read_to_string(&marker) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&marker);
+    let Ok(list) = queue::cli_json(&["pane", "list"]) else {
+        return;
+    };
+    let pane = list["result"]["panes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|p| p["terminal_id"].as_str() == Some(terminal.trim()))
+        .and_then(|p| p["pane_id"].as_str().map(str::to_string));
+    if let Some(pane) = pane {
+        let _ = queue::cli(&["pane", "close", &pane]);
+    }
+}
+
 /// Splits the agent pane and runs `teamsent team` on the right.
 fn open_team_pane(ctx: &Ctx) -> Result<String, String> {
+    close_team_pane();
     let (agent, _) = queue::agent_pane(None)?;
     let split = queue::cli_json(&[
         "pane",
@@ -1057,6 +1092,9 @@ fn open_team_pane(ctx: &Ctx) -> Result<String, String> {
         .as_str()
         .ok_or("split returned no pane")?
         .to_string();
+    if let Some(terminal) = split["result"]["pane"]["terminal_id"].as_str() {
+        let _ = std::fs::write(team_marker_path(), terminal);
+    }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let command = format!(
         "'{}' team",
