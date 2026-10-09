@@ -247,6 +247,17 @@ try:
         time.sleep(1)
         checks["edited text ran"] = "EDITED_14" in pane_text(pane)
 
+    # Team window: role change and kick (what the right-click menu sends).
+    gid = re.search(r"person #(\d+) barguest", team_state())
+    if gid:
+        code, out = team_send({"cmd": "role", "guest": int(gid.group(1)), "role": "viewer"})
+        checks["team role change"] = code == 0 and "is now viewer" in out
+        code, out = team_send({"cmd": "kick", "guest": int(gid.group(1))})
+        checks["team kick"] = code == 0 and "barguest disconnected" in out
+        checks["kicked guest gone"] = composer.exited(8)
+        code, out = run("join", m_part.group(1), "--name", "barguest", timeout=10)
+        checks["kicked link refused"] = code != 0 and "invite revoked" in out
+
     # /revoke: the writer is kicked and its link stops working.
     checks["/revoke reported"] = bool(host_cmd("/revoke 2", r"invite \w+… revoked"))
     checks["revoked guest disconnected"] = writer.exited(8)

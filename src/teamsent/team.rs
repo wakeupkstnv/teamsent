@@ -11,19 +11,58 @@ use std::time::Duration;
 
 use interprocess::TryClone as _;
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::crossterm::{execute, terminal};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
 use serde_json::{json, Value};
 
 use super::host_control_socket_path;
 use super::queue::one_line;
 
-const HELP: &str = "tab people/queue · ↑↓ select · y send · e edit · n reject · d give floor · t take floor · q quit";
+const HELP: &str = "tab people/queue · ↑↓ select · y send · e edit · n reject · d give floor · t take floor · right-click or m: person menu · x kick · q quit";
+
+/// What the person menu can do.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Act {
+    Kick,
+    Drive,
+    Role(&'static str),
+    Cancel,
+}
+
+const MENU: &[(&str, Act)] = &[
+    ("Kick…", Act::Kick),
+    ("Give floor", Act::Drive),
+    ("Make viewer", Act::Role("viewer")),
+    ("Make participant", Act::Role("participant")),
+    ("Make writer", Act::Role("writer")),
+    ("Cancel", Act::Cancel),
+];
+const MENU_WIDTH: u16 = 22;
+
+/// Context menu for one guest, anchored where it was opened.
+struct Menu {
+    guest: u64,
+    name: String,
+    at: Rect,
+    selected: usize,
+}
+
+/// "Kick <name>?" dialog. Kick is not the default button.
+struct Confirm {
+    guest: u64,
+    name: String,
+    kick_selected: bool,
+    kick_button: Rect,
+    cancel_button: Rect,
+}
 
 pub(crate) fn run(args: &[String]) -> io::Result<()> {
     match args {
@@ -156,6 +195,10 @@ struct App {
     /// Inline edit of a suggestion: (id, text).
     editing: Option<(u64, String)>,
     status: String,
+    /// Where the people list was drawn, for mouse hit-testing.
+    people_area: Rect,
+    menu: Option<Menu>,
+    confirm: Option<Confirm>,
 }
 
 impl App {
@@ -187,16 +230,81 @@ impl App {
             .selected()
             .and_then(|i| self.guests().get(i).copied())
     }
+
+    /// Index of the guest row under the mouse, if any.
+    fn guest_at(&self, column: u16, row: u16) -> Option<usize> {
+        let a = self.people_area;
+        let inside = column > a.x
+            && column < a.x + a.width.saturating_sub(1)
+            && row > a.y
+            && row < a.y + a.height.saturating_sub(1);
+        if !inside {
+            return None;
+        }
+        let index = self.people.offset() + (row - a.y - 1) as usize;
+        (index < self.guests().len()).then_some(index)
+    }
+
+    fn open_menu(&mut self, index: usize, column: u16, row: u16) {
+        let Some(guest) = self.guests().get(index).copied() else {
+            return;
+        };
+        let (id, name) = (
+            guest["id"].as_u64().unwrap_or_default(),
+            guest["name"].as_str().unwrap_or_default().to_string(),
+        );
+        self.people.select(Some(index));
+        self.focus = Focus::People;
+        self.menu = Some(Menu {
+            guest: id,
+            name,
+            at: Rect::new(column, row, MENU_WIDTH, MENU.len() as u16 + 2),
+            selected: 0,
+        });
+    }
+
+    fn open_confirm(&mut self, guest: u64, name: String) {
+        self.menu = None;
+        self.confirm = Some(Confirm {
+            guest,
+            name,
+            kick_selected: false,
+            kick_button: Rect::default(),
+            cancel_button: Rect::default(),
+        });
+    }
+
+    /// Runs a menu action; returns the command to send, if any.
+    fn act(&mut self, act: Act) -> Option<Value> {
+        let menu = self.menu.take()?;
+        match act {
+            Act::Kick => {
+                self.open_confirm(menu.guest, menu.name);
+                None
+            }
+            Act::Drive => Some(json!({ "cmd": "drive", "guest": menu.guest })),
+            Act::Role(role) => Some(json!({ "cmd": "role", "guest": menu.guest, "role": role })),
+            Act::Cancel => None,
+        }
+    }
+}
+
+fn contains(r: Rect, column: u16, row: u16) -> bool {
+    column >= r.x && column < r.x + r.width && row >= r.y && row < r.y + r.height
 }
 
 fn tui() -> io::Result<()> {
     let mut stdout = io::stdout();
     terminal::enable_raw_mode()?;
-    execute!(stdout, terminal::EnterAlternateScreen)?;
+    execute!(stdout, terminal::EnterAlternateScreen, EnableMouseCapture)?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
     let result = tui_loop(&mut term);
     terminal::disable_raw_mode()?;
-    execute!(term.backend_mut(), terminal::LeaveAlternateScreen)?;
+    execute!(
+        term.backend_mut(),
+        DisableMouseCapture,
+        terminal::LeaveAlternateScreen
+    )?;
     result
 }
 
@@ -208,6 +316,9 @@ fn tui_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()>
         queue: ListState::default(),
         editing: None,
         status: "connecting to teamsent host…".into(),
+        people_area: Rect::default(),
+        menu: None,
+        confirm: None,
     };
     let mut conn: Option<(mpsc::Receiver<Value>, Writer)> = None;
 
@@ -244,17 +355,62 @@ fn tui_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()>
         if !event::poll(Duration::from_millis(150))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
         let send = |conn: &mut Option<(mpsc::Receiver<Value>, Writer)>, cmd: Value| {
             if let Some((_, w)) = conn {
                 let _ = writeln!(w, "{cmd}");
             }
         };
+        let key = match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => key,
+            Event::Mouse(mouse) => {
+                if let Some(cmd) = on_mouse(&mut app, mouse) {
+                    send(&mut conn, cmd);
+                }
+                continue;
+            }
+            _ => continue,
+        };
+
+        if let Some(confirm) = &mut app.confirm {
+            match key.code {
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                    confirm.kick_selected = !confirm.kick_selected
+                }
+                KeyCode::Char('y') => {
+                    let guest = confirm.guest;
+                    app.confirm = None;
+                    send(&mut conn, json!({ "cmd": "kick", "guest": guest }));
+                }
+                KeyCode::Enter => {
+                    let (guest, kick) = (confirm.guest, confirm.kick_selected);
+                    app.confirm = None;
+                    if kick {
+                        send(&mut conn, json!({ "cmd": "kick", "guest": guest }));
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Esc => app.confirm = None,
+                _ => {}
+            }
+            continue;
+        }
+
+        if let Some(menu) = &mut app.menu {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => menu.selected = menu.selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    menu.selected = (menu.selected + 1).min(MENU.len() - 1)
+                }
+                KeyCode::Enter => {
+                    let act = MENU[menu.selected].1;
+                    if let Some(cmd) = app.act(act) {
+                        send(&mut conn, cmd);
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('q') => app.menu = None,
+                _ => {}
+            }
+            continue;
+        }
 
         if let Some((id, text)) = &mut app.editing {
             match key.code {
@@ -311,9 +467,62 @@ fn tui_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()>
                 }
             }
             KeyCode::Char('t') => send(&mut conn, json!({ "cmd": "take" })),
+            KeyCode::Char('m') => {
+                if let Some(i) = app.people.selected() {
+                    let a = app.people_area;
+                    let row = a.y + 1 + i.saturating_sub(app.people.offset()) as u16;
+                    app.open_menu(i, a.x + 2, row);
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(p) = app.selected_guest() {
+                    let (id, name) = (
+                        p["id"].as_u64().unwrap_or_default(),
+                        p["name"].as_str().unwrap_or_default().to_string(),
+                    );
+                    app.open_confirm(id, name);
+                }
+            }
             _ => {}
         }
     }
+}
+
+/// Mouse: right-click a person for the menu, click menu items and dialog buttons.
+fn on_mouse(app: &mut App, mouse: MouseEvent) -> Option<Value> {
+    let (column, row) = (mouse.column, mouse.row);
+    let MouseEventKind::Down(button) = mouse.kind else {
+        return None;
+    };
+    if let Some(confirm) = &app.confirm {
+        let guest = confirm.guest;
+        let kick = contains(confirm.kick_button, column, row);
+        let cancel = contains(confirm.cancel_button, column, row);
+        if kick || cancel || button == MouseButton::Left {
+            app.confirm = None;
+        }
+        return kick.then(|| json!({ "cmd": "kick", "guest": guest }));
+    }
+    if let Some(menu) = &app.menu {
+        if contains(menu.at, column, row) {
+            let item = row.checked_sub(menu.at.y + 1).map(usize::from);
+            if let Some(&(_, act)) = item.and_then(|i| MENU.get(i)) {
+                return app.act(act);
+            }
+            return None;
+        }
+        app.menu = None;
+    }
+    let hit = app.guest_at(column, row)?;
+    match button {
+        MouseButton::Right => app.open_menu(hit, column, row),
+        MouseButton::Left => {
+            app.people.select(Some(hit));
+            app.focus = Focus::People;
+        }
+        MouseButton::Middle => {}
+    }
+    None
 }
 
 fn clamp(list: &mut ListState, len: usize) {
@@ -411,6 +620,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
             .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
     };
     f.render_stateful_widget(people, people_area, &mut app.people);
+    app.people_area = people_area;
 
     let queue: Vec<ListItem> = app
         .queue_items()
@@ -473,11 +683,172 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         .wrap(Wrap { trim: true }),
         footer,
     );
+
+    let screen = f.area();
+    if let Some(menu) = &mut app.menu {
+        let area = fit(menu.at, screen);
+        menu.at = area;
+        let items: Vec<ListItem> = MENU
+            .iter()
+            .enumerate()
+            .map(|(i, (label, act))| {
+                let style = if *act == Act::Kick {
+                    Style::new().red()
+                } else {
+                    Style::new()
+                };
+                let style = if i == menu.selected {
+                    style.add_modifier(Modifier::REVERSED)
+                } else {
+                    style
+                };
+                ListItem::new(Line::styled(format!(" {label}"), style))
+            })
+            .collect();
+        f.render_widget(Clear, area);
+        f.render_widget(
+            List::new(items).block(Block::bordered().title(format!(" {} ", menu.name))),
+            area,
+        );
+    }
+
+    if let Some(confirm) = &mut app.confirm {
+        let width = 46.min(screen.width);
+        let area = fit(
+            Rect::new(
+                screen.x + screen.width.saturating_sub(width) / 2,
+                screen.y + screen.height.saturating_sub(7) / 2,
+                width,
+                7,
+            ),
+            screen,
+        );
+        f.render_widget(Clear, area);
+        let block = Block::bordered().title(" kick ").red();
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(format!("Kick {}?", confirm.name)).bold(),
+                Line::from("They are disconnected and their invite link stops working.").dim(),
+            ])
+            .wrap(Wrap { trim: true }),
+            Rect::new(
+                inner.x,
+                inner.y,
+                inner.width,
+                inner.height.saturating_sub(1),
+            ),
+        );
+        let row = inner.y + inner.height.saturating_sub(1);
+        let kick = " Kick ";
+        let cancel = " Cancel ";
+        confirm.kick_button = Rect::new(inner.x + 1, row, kick.len() as u16, 1);
+        confirm.cancel_button =
+            Rect::new(inner.x + 3 + kick.len() as u16, row, cancel.len() as u16, 1);
+        let button = |label: &str, selected: bool, danger: bool| {
+            let style = if danger {
+                Style::new().red()
+            } else {
+                Style::new()
+            };
+            Paragraph::new(label.to_string()).style(if selected {
+                style.add_modifier(Modifier::REVERSED)
+            } else {
+                style
+            })
+        };
+        f.render_widget(
+            button(kick, confirm.kick_selected, true),
+            confirm.kick_button,
+        );
+        f.render_widget(
+            button(cancel, !confirm.kick_selected, false),
+            confirm.cancel_button,
+        );
+    }
+}
+
+/// Moves `r` so it stays inside `screen` (shrinking it if the screen is smaller).
+fn fit(r: Rect, screen: Rect) -> Rect {
+    let width = r.width.min(screen.width);
+    let height = r.height.min(screen.height);
+    let x = r.x.min(screen.x + screen.width - width);
+    let y = r.y.min(screen.y + screen.height - height);
+    Rect::new(x, y, width, height)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn app_with_guests() -> App {
+        App {
+            state: json!({ "people": [
+                { "id": 0, "name": "host" },
+                { "id": 2, "name": "kolya", "role": "participant" },
+                { "id": 3, "name": "asel", "role": "writer" },
+            ] }),
+            focus: Focus::Queue,
+            people: ListState::default(),
+            queue: ListState::default(),
+            editing: None,
+            status: String::new(),
+            people_area: Rect::new(0, 3, 40, 4),
+            menu: None,
+            confirm: None,
+        }
+    }
+
+    fn click(button: MouseButton, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(button),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn right_click_menu_kick_needs_confirmation() {
+        let mut app = app_with_guests();
+        // Row 5 is the second guest (asel): border at y=3, kolya at 4, asel at 5.
+        assert_eq!(on_mouse(&mut app, click(MouseButton::Right, 5, 5)), None);
+        let menu = app.menu.as_ref().expect("menu opened");
+        assert_eq!((menu.guest, menu.name.as_str()), (3, "asel"));
+        // First item is "Kick…": it opens the dialog and sends nothing yet.
+        let (x, y) = (menu.at.x + 1, menu.at.y + 1);
+        assert_eq!(on_mouse(&mut app, click(MouseButton::Left, x, y)), None);
+        let confirm = app.confirm.as_mut().expect("confirm dialog");
+        assert!(!confirm.kick_selected, "Cancel is the default");
+        confirm.kick_button = Rect::new(10, 10, 6, 1);
+        assert_eq!(
+            on_mouse(&mut app, click(MouseButton::Left, 11, 10)),
+            Some(json!({ "cmd": "kick", "guest": 3 }))
+        );
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn clicking_outside_closes_dialog_without_kicking() {
+        let mut app = app_with_guests();
+        app.open_confirm(2, "kolya".into());
+        assert_eq!(on_mouse(&mut app, click(MouseButton::Left, 0, 0)), None);
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn menu_role_items_send_role_commands() {
+        let mut app = app_with_guests();
+        on_mouse(&mut app, click(MouseButton::Right, 5, 4));
+        let menu = app.menu.as_ref().unwrap();
+        let writer_row = menu.at.y + 1 + 4; // "Make writer"
+        let x = menu.at.x + 1;
+        assert_eq!(
+            on_mouse(&mut app, click(MouseButton::Left, x, writer_row)),
+            Some(json!({ "cmd": "role", "guest": 2, "role": "writer" }))
+        );
+    }
 
     #[test]
     fn plain_view_lists_drafts_queue_and_floor() {

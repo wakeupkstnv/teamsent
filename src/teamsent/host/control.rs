@@ -5,7 +5,8 @@
 //! commands and gets `{"t":"result","ok","msg"}` back.
 //!
 //! Commands: `{"cmd":"approve","id",["pane"]}`, `{"cmd":"reject","id"}`,
-//! `{"cmd":"edit","id","text"}`, `{"cmd":"drive","guest"}`, `{"cmd":"take"}`.
+//! `{"cmd":"edit","id","text"}`, `{"cmd":"drive","guest"}`, `{"cmd":"take"}`,
+//! `{"cmd":"role","guest","role"}`, `{"cmd":"kick","guest"}`.
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::sync::{Arc, Mutex};
@@ -15,8 +16,9 @@ use interprocess::local_socket::traits::Listener as _;
 use interprocess::TryClone as _;
 use serde_json::{json, Value};
 
-use super::{approve, edit, give_floor, reject, snapshot, take_floor, Ctx};
+use super::{approve, edit, give_floor, grant, kick, reject, snapshot, take_floor, Ctx};
 use crate::teamsent::host_control_socket_path;
+use crate::teamsent::Role;
 
 const STATE_POLL: Duration = Duration::from_millis(200);
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
@@ -81,12 +83,33 @@ fn run(ctx: &Ctx, cmd: &Value) -> Result<String, String> {
             .map(|n| n as u32)
             .ok_or("missing id".to_string())
     };
+    let guest = || {
+        cmd["guest"]
+            .as_u64()
+            .map(|n| n as u32)
+            .ok_or("missing guest".to_string())
+    };
     match cmd["cmd"].as_str().unwrap_or_default() {
         "approve" => approve(ctx, id()?, cmd["pane"].as_str()),
         "reject" => reject(ctx, id()?),
         "edit" => edit(ctx, id()?, cmd["text"].as_str().unwrap_or_default()),
-        "drive" => give_floor(ctx, cmd["guest"].as_u64().ok_or("missing guest")? as u32),
+        "drive" => give_floor(ctx, guest()?),
         "take" => Ok(take_floor(ctx)),
+        "role" => {
+            let role = cmd["role"]
+                .as_str()
+                .and_then(Role::parse)
+                .ok_or("unknown role")?;
+            grant(ctx, guest()?, role)
+        }
+        "kick" => {
+            let lines = kick(ctx, guest()?);
+            if lines.first().is_some_and(|l| l.starts_with("no guest")) {
+                Err(lines.join("; "))
+            } else {
+                Ok(lines.join("; "))
+            }
+        }
         other => Err(format!("unknown command {other:?}")),
     }
 }

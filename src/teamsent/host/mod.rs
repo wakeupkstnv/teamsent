@@ -310,30 +310,14 @@ fn run_command(line: &str, ctx: &Ctx, relay: &str, room: &str) -> Vec<String> {
                 format!("  teamsent join {}", join_link(relay, room, &token)),
             ]
         }
-        ["/grant", id, role] => {
-            let (Some(id), Some(role)) = (parse_guest_id(id), Role::parse(role)) else {
-                return vec![format!("usage: /grant <guest#> <role>; roles: {ROLES}")];
-            };
-            let mut state = state.lock().unwrap();
-            match state.guests.get_mut(&id) {
-                Some(guest) => {
-                    guest.role = role;
-                    ctx.audit.record(
-                        "grant",
-                        json!({ "guest": id, "name": guest.name, "role": role.as_str() }),
-                    );
-                    vec![format!("#{id} {} is now {}", guest.name, role.as_str())]
-                }
-                None => vec![format!("no guest #{id}")],
-            }
-        }
-        ["/revoke", id] => {
-            let Some(id) = parse_guest_id(id) else {
-                return vec!["usage: /revoke <guest#>".into()];
-            };
-            ctx.audit.record("revoke", json!({ "guest": id }));
-            revoke(state, id)
-        }
+        ["/grant", id, role] => match (parse_guest_id(id), Role::parse(role)) {
+            (Some(id), Some(role)) => vec![grant(ctx, id, role).unwrap_or_else(|e| e)],
+            _ => vec![format!("usage: /grant <guest#> <role>; roles: {ROLES}")],
+        },
+        ["/revoke", id] => match parse_guest_id(id) {
+            Some(id) => kick(ctx, id),
+            None => vec!["usage: /revoke <guest#>".into()],
+        },
         ["/q"] => ctx.queue.lock().unwrap().lines(),
         ["/y", id, rest @ ..] if rest.len() <= 1 => match parse_guest_id(id) {
             Some(id) => vec![approve(ctx, id, rest.first().copied()).unwrap_or_else(|e| e)],
@@ -835,6 +819,29 @@ fn edit(ctx: &Ctx, sid: u32, text: &str) -> Result<String, String> {
     Ok(format!("#{sid} edited"))
 }
 
+fn grant(ctx: &Ctx, id: u32, role: Role) -> Result<String, String> {
+    let mut state = ctx.state.lock().unwrap();
+    let guest = state.guests.get_mut(&id).ok_or(format!("no guest #{id}"))?;
+    guest.role = role;
+    let name = guest.name.clone();
+    if role != Role::Writer && state.driver.is_some_and(|(d, _)| d == id) {
+        state.driver = None;
+    }
+    ctx.audit.record(
+        "grant",
+        json!({ "guest": id, "name": name, "role": role.as_str() }),
+    );
+    Ok(format!("#{id} {name} is now {}", role.as_str()))
+}
+
+/// Disconnects the guest and burns their invite link (`/revoke`, Team window kick).
+fn kick(ctx: &Ctx, id: u32) -> Vec<String> {
+    let name = guest_name(&ctx.state, id);
+    ctx.audit
+        .record("revoke", json!({ "guest": id, "name": name }));
+    revoke(&ctx.state, id)
+}
+
 /// Gives the floor to a guest, promoting them to writer if needed.
 fn give_floor(ctx: &Ctx, id: u32) -> Result<String, String> {
     let name = {
@@ -936,6 +943,9 @@ fn open_team_pane(ctx: &Ctx) -> Result<String, String> {
         "right",
         "--ratio",
         "0.7",
+        // Right-clicks reach the Team window (its context menu), not herdr's menu.
+        "--right-click",
+        "pane",
     ])?;
     let pane = split["result"]["pane"]["pane_id"]
         .as_str()
