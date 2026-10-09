@@ -3,9 +3,12 @@
 //! `host` exposes the local herdr server through a relay, `join` attaches a
 //! guest herdr client to it, `relay` pairs the two. See `design/herdr-recon.md`.
 
+mod audit;
 mod filter;
 mod host;
 mod join;
+mod queue;
+mod say;
 
 use std::io;
 use std::time::Duration;
@@ -18,6 +21,7 @@ pub(crate) fn maybe_run(args: &[String]) -> Option<io::Result<()>> {
     match args.get(1).map(String::as_str)? {
         "host" => Some(with_tls(|| host::run(rest))),
         "join" => Some(with_tls(|| join::run(rest))),
+        "say" => Some(with_tls(|| say::run(rest))),
         "relay" => Some(teamsent_relay::run(rest)),
         _ => None,
     }
@@ -38,6 +42,8 @@ pub(crate) const MAX_INVITE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 pub(crate) enum Role {
     /// Watch only.
     Viewer,
+    /// Watch and suggest prompts; the host approves each one.
+    Participant,
     /// Type into panes and navigate; cannot create, close or reconfigure.
     Writer,
 }
@@ -46,6 +52,7 @@ impl Role {
     pub(crate) fn parse(s: &str) -> Option<Self> {
         match s {
             "viewer" => Some(Self::Viewer),
+            "participant" => Some(Self::Participant),
             "writer" => Some(Self::Writer),
             _ => None,
         }
@@ -54,6 +61,7 @@ impl Role {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Viewer => "viewer",
+            Self::Participant => "participant",
             Self::Writer => "writer",
         }
     }
@@ -88,6 +96,23 @@ pub(crate) fn is_valid_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Accepts `ws(s)://HOST/join/ROOM/TOKEN`.
+pub(crate) fn is_join_link(link: &str) -> bool {
+    (link.starts_with("ws://") || link.starts_with("wss://"))
+        && !link.contains('?')
+        && link
+            .split_once("/join/")
+            .is_some_and(|(_, rest)| rest.split('/').filter(|s| !s.is_empty()).count() == 2)
+}
+
+/// `$USER` if it is a valid display name, else `guest`.
+pub(crate) fn default_name() -> String {
+    std::env::var("USER")
+        .ok()
+        .filter(|n| is_valid_name(n))
+        .unwrap_or_else(|| "guest".to_string())
 }
 
 /// 128-bit random id, hex encoded. Used for rooms, host keys and invite tokens.

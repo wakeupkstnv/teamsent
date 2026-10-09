@@ -119,7 +119,7 @@ fn classify(role: Role, msg: ClientMessage) -> Verdict {
         | M::ClientShellPopupInput { .. }
         | M::AttachMouse { .. } => match role {
             Role::Writer => Verdict::Forward,
-            Role::Viewer => Verdict::Drop("input"),
+            Role::Viewer | Role::Participant => Verdict::Drop("input"),
         },
 
         M::AttachTerminal { .. } | M::ControlTerminal { .. } => Verdict::Drop("terminal control"),

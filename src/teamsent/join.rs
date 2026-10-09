@@ -18,7 +18,7 @@ use interprocess::TryClone as _;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{is_valid_name, shutdown_local_stream};
+use super::{default_name, is_join_link, is_valid_name, shutdown_local_stream};
 
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
 const READ_CHUNK: usize = 64 * 1024;
@@ -96,21 +96,6 @@ pub(crate) fn run(args: &[String]) -> io::Result<()> {
     let _ = crate::ipc::remove_socket_file_if_owned(&socket_path, &identity);
     runtime.shutdown_timeout(Duration::from_millis(200));
     status
-}
-
-fn is_join_link(link: &str) -> bool {
-    (link.starts_with("ws://") || link.starts_with("wss://"))
-        && !link.contains('?')
-        && link
-            .split_once("/join/")
-            .is_some_and(|(_, rest)| rest.split('/').filter(|s| !s.is_empty()).count() == 2)
-}
-
-fn default_name() -> String {
-    std::env::var("USER")
-        .ok()
-        .filter(|n| is_valid_name(n))
-        .unwrap_or_else(|| "guest".to_string())
 }
 
 /// Asks the host whether this invite is valid before starting the client UI.

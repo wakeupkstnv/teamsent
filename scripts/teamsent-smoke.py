@@ -162,6 +162,30 @@ try:
     viewer.drain(2)
     checks["granted viewer can type"] = "GRANTED_5_INPUT" in pane_text(pane)
 
+    # Suggestions: viewers cannot suggest; a participant's suggestion waits for /y.
+    code, out = run("say", viewer_link, "--name", "viewer2", "echo NOPE", timeout=15)
+    checks["viewer cannot suggest"] = code != 0 and "viewers cannot suggest" in out
+    m_part = host_cmd("/invite participant 10m", r"teamsent join (\S+)")
+    assert m_part, "no participant link"
+    code, out = run("say", m_part.group(1), "--name", "part1", "echo SUGGESTED_$((6+6))", timeout=15)
+    sid = re.search(r"queued as #(\d+)", out)
+    checks["participant suggestion queued"] = code == 0 and bool(sid)
+    checks["host sees suggestion"] = bool(wait_log(host_log, r"#\d+ from part1#\d+: echo SUGGESTED", 5))
+    time.sleep(1)
+    checks["not sent before approval"] = "SUGGESTED_12" not in pane_text(pane)
+    if sid:
+        host_cmd(f"/y {sid.group(1)} {pane}", r"approved")
+        checks["approved suggestion delivered"] = bool(wait_log(host_log, rf"#{sid.group(1)} delivered", 15))
+        time.sleep(1)
+        checks["suggestion ran in pane"] = "SUGGESTED_12" in pane_text(pane)
+    code, out = run("say", m_part.group(1), "--name", "part1", "echo REJECTED_$((1+2))", timeout=15)
+    sid2 = re.search(r"queued as #(\d+)", out)
+    if sid2:
+        checks["/n rejects"] = bool(host_cmd(f"/n {sid2.group(1)}", r"rejected"))
+        time.sleep(1)
+        checks["rejected never sent"] = "REJECTED_3" not in pane_text(pane)
+    checks["audit has suggestion events"] = bool(host_cmd("/log 50", r"suggestion_sent"))
+
     # /revoke: the writer is kicked and its link stops working.
     checks["/revoke reported"] = bool(host_cmd("/revoke 2", r"invite \w+… revoked"))
     checks["revoked guest disconnected"] = writer.exited(8)
